@@ -2,10 +2,15 @@
 
 Last reviewed: 2026-08-10
 
-Freshness source: `.golangci.yml`, `scripts/ci/pr-lint.sh`, `Makefile`,
-`.github/workflows/pr.yml`, and `.github/workflows/main.yml`.
+Freshness source: `.golangci.yml`, `scripts/ci/pr-lint.sh`, `Makefile`, and
+`.github/FORK-AUTOMATION-POLICY.md`.
 
 This document explains the required Go lint gate for this codebase.
+
+The lane descriptions below document the upstream CI contract. This `gho` fork
+intentionally carries no executable GitHub Actions workflows; its active local
+validation surface is the repository-owned Make targets and scripts. See
+`.github/FORK-AUTOMATION-POLICY.md`.
 
 ## Current Status
 

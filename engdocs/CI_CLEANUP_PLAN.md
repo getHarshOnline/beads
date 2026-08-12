@@ -2,13 +2,19 @@
 
 Last reviewed: 2026-08-10
 
-Freshness source: `engdocs/CI_TEST_SURFACE_AUDIT.md`, `.github/workflows/*.yml`,
-`.buildflags`, `.golangci.yml`, `scripts/ci/pr-lint.sh`, `Makefile`, package test
-manifests, and maintainer decision review.
+Freshness source: `engdocs/CI_TEST_SURFACE_AUDIT.md`,
+`.github/FORK-AUTOMATION-POLICY.md`, `.buildflags`, `.golangci.yml`,
+`scripts/ci/pr-lint.sh`, `Makefile`, package test manifests, and maintainer
+decision review.
 
 This document records the agreed target shape for CI cleanup. It is the policy
 and roadmap layer; the current inventory remains in
 [`CI_TEST_SURFACE_AUDIT.md`](CI_TEST_SURFACE_AUDIT.md).
+
+This retained plan describes the upstream CI topology. The `gho` fork
+intentionally carries no executable GitHub Actions workflows; workflow paths
+below are upstream design references, not active fork automation. See
+`.github/FORK-AUTOMATION-POLICY.md`.
 
 ## Goals
 
