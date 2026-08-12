@@ -1,6 +1,6 @@
 # Beads (bd) Windows installer
 # Usage:
-#   irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -80,7 +80,7 @@ function Install-WithGo {
 
     Write-Info "Installing bd via go install..."
     try {
-        & go install github.com/steveyegge/beads/cmd/bd@latest
+        & go install -tags gms_pure_go github.com/steveyegge/beads/cmd/bd@latest
         if ($LASTEXITCODE -ne 0) {
             Write-WarningMsg "go install exited with code $LASTEXITCODE"
             return $false
@@ -136,6 +136,43 @@ function Get-WindowsArch {
     }
 }
 
+function Get-ExpectedReleaseChecksum {
+    param(
+        [Parameter(Mandatory)]$Release,
+        [Parameter(Mandatory)][string]$AssetName,
+        [Parameter(Mandatory)][string]$TempRoot
+    )
+
+    $checksumsAsset = $Release.assets | Where-Object { $_.name -eq "checksums.txt" } | Select-Object -First 1
+    if (-not $checksumsAsset) {
+        Write-WarningMsg "Release does not include checksums.txt; refusing unverified install."
+        return $null
+    }
+
+    $checksumsPath = Join-Path $TempRoot "checksums.txt"
+    try {
+        Invoke-WebRequest -Uri $checksumsAsset.browser_download_url -OutFile $checksumsPath
+    } catch {
+        Write-WarningMsg "Failed to download checksums.txt: $_"
+        return $null
+    }
+
+    foreach ($line in Get-Content -Path $checksumsPath) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq "") {
+            continue
+        }
+
+        $parts = $trimmed -split '\s+'
+        if ($parts.Count -ge 2 -and $parts[1].TrimStart("*") -eq $AssetName) {
+            return $parts[0].ToLowerInvariant()
+        }
+    }
+
+    Write-WarningMsg "No checksum entry found for $AssetName in checksums.txt"
+    return $null
+}
+
 function Install-FromRelease {
     Write-Info "Installing bd from GitHub releases..."
 
@@ -145,7 +182,7 @@ function Install-FromRelease {
         return $false
     }
 
-    $apiUrl = "https://api.github.com/repos/steveyegge/beads/releases/latest"
+    $apiUrl = "https://api.github.com/repos/gastownhall/beads/releases/latest"
     try {
         $release = Invoke-RestMethod -Uri $apiUrl -Headers @{ "User-Agent" = "beads-install" }
     } catch {
@@ -174,6 +211,20 @@ function Install-FromRelease {
     try {
         Write-Info "Downloading $assetName..."
         Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+
+        Write-Info "Verifying release checksum..."
+        $expectedChecksum = Get-ExpectedReleaseChecksum -Release $release -AssetName $assetName -TempRoot $tempRoot
+        if (-not $expectedChecksum) {
+            return $false
+        }
+
+        $actualChecksum = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actualChecksum -ne $expectedChecksum) {
+            Write-WarningMsg "Checksum mismatch for $assetName; refusing to install."
+            return $false
+        }
+
+        Write-Success "Checksum verified for $assetName"
 
         Write-Info "Extracting archive..."
         Microsoft.PowerShell.Archive\Expand-Archive -Path $zipPath -DestinationPath $tempRoot -Force
@@ -235,7 +286,7 @@ function Install-FromSource {
             }
         } else {
             Write-Info "Cloning repository..."
-            & git clone --depth 1 https://github.com/steveyegge/beads.git $repoPath
+            & git clone --depth 1 https://github.com/gastownhall/beads.git $repoPath
             if ($LASTEXITCODE -ne 0) {
                 throw "git clone failed with exit code $LASTEXITCODE"
             }
@@ -244,7 +295,7 @@ function Install-FromSource {
         Push-Location $repoPath
         try {
             Write-Info "Compiling bd.exe..."
-            & go build -o bd.exe ./cmd/bd
+            & go build -tags gms_pure_go -o bd.exe ./cmd/bd
             if ($LASTEXITCODE -ne 0) {
                 throw "go build failed with exit code $LASTEXITCODE"
             }
@@ -416,3 +467,4 @@ if ($installed) {
     Write-Err "Installation failed. Please install Go 1.24+ and try again."
     exit 1
 }
+

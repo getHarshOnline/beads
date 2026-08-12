@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"time"
 
@@ -14,6 +13,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
 )
 
 // ServerHealthResult holds the results of all server health checks
@@ -61,9 +61,8 @@ func RunServerHealthChecks(path string) ServerHealthResult {
 		result.Checks = append(result.Checks, DoctorCheck{
 			Name:     "Server Config",
 			Status:   StatusWarning,
-			Message:  fmt.Sprintf("Backend is '%s', not Dolt", cfg.GetBackend()),
-			Detail:   "Server mode health checks are only relevant for Dolt backend",
-			Fix:      "Set backend: dolt in metadata.json to use Dolt server mode",
+			Message:  fmt.Sprintf("Server checks require Dolt; configured backend is %q", cfg.GetBackend()),
+			Detail:   "Dolt server health checks do not apply to this backend",
 			Category: CategoryFederation,
 		})
 		result.OverallOK = false
@@ -163,8 +162,8 @@ func RunServerHealthChecks(path string) ServerHealthResult {
 // - testdb_*: BEADS_TEST_MODE=1 FNV hash of temp paths
 // - doctest_*: doctor test helpers
 // - doctortest_*: doctor test helpers
-// - beads_pt*: gastown patrol_helpers_test.go random prefixes
-// - beads_vr*: gastown mail/router_test.go random prefixes
+// - beads_pt*: orchestrator patrol_helpers_test.go random prefixes
+// - beads_vr*: orchestrator mail/router_test.go random prefixes
 // - beads_t[0-9a-f]*: protocol test random prefixes (t + 8 hex chars)
 var staleDatabasePrefixes = []string{
 	"testdb_",
@@ -263,7 +262,7 @@ func checkStaleDatabases(db *sql.DB) DoctorCheck {
 // checkServerReachable checks if the server is reachable via TCP
 func checkServerReachable(host string, port int) DoctorCheck {
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	_, err := doltserver.ProbeSQLServer("tcp", addr, 5*time.Second)
 	if err != nil {
 		return DoctorCheck{
 			Name:     "Server Reachable",
@@ -274,7 +273,6 @@ func checkServerReachable(host string, port int) DoctorCheck {
 			Category: CategoryFederation,
 		}
 	}
-	_ = conn.Close() // Best effort cleanup
 
 	return DoctorCheck{
 		Name:     "Server Reachable",
@@ -291,18 +289,21 @@ func checkDoltVersion(cfg *configfile.Config, beadsDir string) (DoctorCheck, *sq
 	port := doltserver.DefaultConfig(beadsDir).Port
 	user := cfg.GetDoltServerUser()
 
-	// Get password from environment (more secure than config file)
-	password := os.Getenv("BEADS_DOLT_PASSWORD")
+	// Resolve password the same way the CRUD path does: BEADS_DOLT_PASSWORD env
+	// takes precedence (checked inside GetDoltServerPasswordForPort), with a
+	// fallback to ~/.config/beads/credentials keyed by [host:port]. Using the
+	// resolved runtime port is required because the port file may differ from
+	// the metadata port (bd-h5k7).
+	password := cfg.GetDoltServerPasswordForPort(port)
 
 	// Build DSN without database (just to test server connectivity)
-	var connStr string
-	if password != "" {
-		connStr = fmt.Sprintf("%s:%s@tcp(%s:%d)/?parseTime=true&timeout=5s",
-			user, password, host, port)
-	} else {
-		connStr = fmt.Sprintf("%s@tcp(%s:%d)/?parseTime=true&timeout=5s",
-			user, host, port)
-	}
+	connStr := doltutil.ServerDSN{
+		Host:     host,
+		Port:     port,
+		User:     user,
+		Password: password,
+		TLS:      cfg.GetDoltServerTLS(),
+	}.String()
 
 	db, err := sql.Open("mysql", connStr)
 	if err != nil {
@@ -433,7 +434,7 @@ func checkDatabaseExists(db *sql.DB, database string) DoctorCheck {
 			Name:     "Database Exists",
 			Status:   StatusError,
 			Message:  fmt.Sprintf("Database '%s' not found", database),
-			Fix:      fmt.Sprintf("Run 'bd init' to create the '%s' database", database),
+			Fix:      fmt.Sprintf("Run 'bd bootstrap' to recover the existing '%s' database safely. Use 'bd init' only for brand-new projects.", database),
 			Category: CategoryFederation,
 		}
 	}
@@ -519,7 +520,7 @@ func checkSchemaCompatible(db *sql.DB, database string) DoctorCheck {
 
 	// Query metadata table for bd_version
 	var bdVersion string
-	err = db.QueryRowContext(ctx, "SELECT value FROM metadata WHERE `key` = 'bd_version'").Scan(&bdVersion)
+	err = db.QueryRowContext(ctx, "SELECT value FROM local_metadata WHERE `key` = 'bd_version'").Scan(&bdVersion)
 	if err != nil && err != sql.ErrNoRows {
 		if strings.Contains(err.Error(), "doesn't exist") || strings.Contains(err.Error(), "Unknown table") {
 			return DoctorCheck{

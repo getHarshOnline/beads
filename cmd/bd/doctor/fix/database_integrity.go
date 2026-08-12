@@ -5,13 +5,16 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/steveyegge/beads/internal/configfile"
 )
 
 // DatabaseIntegrity attempts to recover from database corruption by:
 //  1. Backing up the corrupt database
 //  2. Re-initializing via bd init (which will clone from remote if configured)
 func DatabaseIntegrity(path string) error {
-	if err := validateBeadsWorkspace(path); err != nil {
+	beadsDir, err := resolvedWorkspaceBeadsDir(path)
+	if err != nil {
 		return err
 	}
 
@@ -20,12 +23,15 @@ func DatabaseIntegrity(path string) error {
 		return fmt.Errorf("failed to resolve path: %w", err)
 	}
 
-	beadsDir := filepath.Join(absPath, ".beads")
 	return doltIntegrityRecovery(absPath, beadsDir)
 }
 
 // doltIntegrityRecovery backs up the corrupted Dolt database and reinitializes.
 func doltIntegrityRecovery(path, beadsDir string) error {
+	if err := serverModeIntegrityRecoveryGuard(beadsDir); err != nil {
+		return err
+	}
+
 	doltPath := getDatabasePath(beadsDir)
 
 	// Check if dolt directory exists
@@ -50,7 +56,7 @@ func doltIntegrityRecovery(path, beadsDir string) error {
 	}
 
 	// Reinitialize: bd init --force -q
-	// bd init will clone from remote if sync.git-remote is configured.
+	// bd init will clone from remote if sync.remote is configured.
 	fmt.Printf("  Reinitializing Dolt database (will clone from remote if configured)\n")
 	initCmd := newBdCmd(bdBinary, "init", "--force", "-q", "--skip-hooks")
 	initCmd.Dir = path
@@ -68,4 +74,22 @@ func doltIntegrityRecovery(path, beadsDir string) error {
 	fmt.Printf("  Recovered Dolt database\n")
 	fmt.Printf("  Corrupted database preserved at: %s\n", filepath.Base(backupPath))
 	return nil
+}
+
+func serverModeIntegrityRecoveryGuard(beadsDir string) error {
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg == nil || !cfg.IsDoltServerMode() {
+		return nil
+	}
+
+	dbName := cfg.GetDoltDatabase()
+	if dbName == "" {
+		dbName = configfile.DefaultDoltDatabase
+	}
+
+	return fmt.Errorf(
+		"automatic integrity recovery is disabled for server-mode repos because it can replace the wrong Dolt root; preserve %s and verify the configured database %q manually before reinitializing",
+		getDatabasePath(beadsDir),
+		dbName,
+	)
 }

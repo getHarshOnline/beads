@@ -3,7 +3,6 @@ package doctor
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/steveyegge/beads/internal/storage/dolt"
@@ -16,23 +15,39 @@ const SuppressConfigPrefix = "doctor.suppress."
 // GetSuppressedChecks reads doctor.suppress.* config keys from the database
 // and returns a set of suppressed check slugs (e.g., "git-hooks", "pending-migrations").
 // Returns an empty map if the database can't be opened or no suppressions are configured.
+// Opens its own store; prefer GetSuppressedChecksWithStore when a shared store is available.
 func GetSuppressedChecks(path string) map[string]bool {
 	suppressed := make(map[string]bool)
 
-	beadsDir := filepath.Join(path, ".beads")
-	beadsDir = resolveBeadsDir(beadsDir)
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
 		return suppressed
 	}
 
 	ctx := context.Background()
-	store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
+	store, err := dolt.NewFromConfigWithCLIOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	if err != nil {
 		return suppressed
 	}
 	defer func() { _ = store.Close() }()
 
+	return getSuppressedChecksFromStore(store)
+}
+
+// GetSuppressedChecksWithStore reads suppressed checks using a shared store (GH#2636).
+func GetSuppressedChecksWithStore(ss *SharedStore) map[string]bool {
+	store := ss.Store()
+	if store == nil {
+		return make(map[string]bool)
+	}
+	return getSuppressedChecksFromStore(store)
+}
+
+func getSuppressedChecksFromStore(store *dolt.DoltStore) map[string]bool {
+	suppressed := make(map[string]bool)
+
+	ctx := context.Background()
 	allConfig, err := store.GetAllConfig(ctx)
 	if err != nil {
 		return suppressed

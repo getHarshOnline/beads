@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,33 +12,19 @@ import (
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/storage"
 )
 
-// dbQuerier abstracts query execution so callers can use a retry-wrapped
-// DoltStore.QueryContext instead of a raw *sql.DB.  Both *sql.DB and
-// *dolt.DoltStore satisfy this interface.
-type dbQuerier interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}
-
-// backupState tracks watermarks for incremental backup.
+// backupState tracks watermarks for backup change detection.
 type backupState struct {
 	LastDoltCommit string    `json:"last_dolt_commit"`
-	LastEventID    int64     `json:"last_event_id"`
 	Timestamp      time.Time `json:"timestamp"`
-	Counts         struct {
-		Issues       int `json:"issues"`
-		Events       int `json:"events"`
-		Comments     int `json:"comments"`
-		Dependencies int `json:"dependencies"`
-		Labels       int `json:"labels"`
-		Config       int `json:"config"`
-	} `json:"counts"`
 }
 
 // backupDir returns the backup directory path, creating it if needed.
 // When backup.git-repo is set to a valid git repo, returns a backup/ subdirectory
-// inside that repo. Otherwise falls back to .beads/backup/.
+// inside that repo. Otherwise it requires an active beads workspace and uses its
+// backup/ subdirectory.
 func backupDir() (string, error) {
 	gitRepo := config.GetString("backup.git-repo")
 	if gitRepo != "" {
@@ -49,7 +33,7 @@ func backupDir() (string, error) {
 			gitRepo = filepath.Join(home, gitRepo[2:])
 		}
 		if _, err := os.Stat(filepath.Join(gitRepo, ".git")); err != nil {
-			debug.Logf("backup: git-repo %s is not a git repo, falling back to .beads/backup\n", gitRepo)
+			fmt.Fprintf(os.Stderr, "Warning: backup.git-repo %s is not a git repo, falling back to .beads/backup\n", gitRepo)
 		} else {
 			dir := filepath.Join(gitRepo, "backup")
 			if err := os.MkdirAll(dir, 0700); err != nil {
@@ -60,7 +44,7 @@ func backupDir() (string, error) {
 	}
 	beadsDir := beads.FindBeadsDir()
 	if beadsDir == "" {
-		beadsDir = ".beads"
+		return "", fmt.Errorf("%s; %s", activeWorkspaceNotFoundError(), diagHint())
 	}
 	dir := filepath.Join(beadsDir, "backup")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -95,7 +79,20 @@ func saveBackupState(dir string, state *backupState) error {
 	return atomicWriteFile(filepath.Join(dir, "backup_state.json"), data)
 }
 
-// atomicWriteFile writes data to a temp file and renames it into place (crash-safe).
+// atomicWriteFile writes data to a same-directory temp file, fsyncs the
+// temp file's own contents, then renames it into place. This avoids a
+// truncated/partial file at path if the process crashes mid-write.
+//
+// Two caveats this does NOT cover, narrowing the "crash-safe" claim rather
+// than the implementation (existing callers' behavior is unchanged here):
+//   - Only the temp file's contents are fsynced, not the parent directory
+//     entry; a crash between the rename and a subsequent directory fsync
+//     can still lose the rename itself on some filesystems.
+//   - os.Rename's atomic-replace guarantee is a POSIX/Unix property; it is
+//     not guaranteed on Windows. It also does not follow a symlink at
+//     path — it replaces whatever is there, symlink or not — so a caller
+//     that must preserve a symlink's target should resolve path with
+//     filepath.EvalSymlinks first (see cmd/bd/proxied_server.go).
 func atomicWriteFile(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".backup-tmp-*")
@@ -125,7 +122,7 @@ func atomicWriteFile(path string, data []byte) error {
 	return nil
 }
 
-// runBackupExport exports all tables to JSONL files in .beads/backup/.
+// runBackupExport performs a Dolt-native backup to .beads/backup/.
 // Returns the updated state.
 func runBackupExport(ctx context.Context, force bool) (*backupState, error) {
 	dir, err := backupDir()
@@ -150,48 +147,27 @@ func runBackupExport(ctx context.Context, force bool) (*backupState, error) {
 		}
 	}
 
-	// Export issues only — wisps are ephemeral and excluded from backup.
-	// They can be regenerated from the database if needed for disaster recovery.
-	n, err := exportTable(ctx, store, dir, "issues.jsonl", "SELECT * FROM issues ORDER BY id")
-	if err != nil {
-		return nil, fmt.Errorf("backup issues: %w", err)
+	bs, ok := storage.UnwrapStore(store).(storage.BackupStore)
+	if !ok {
+		return nil, fmt.Errorf("storage backend does not support backup operations")
 	}
-	state.Counts.Issues = n
 
-	n, err = exportTable(ctx, store, dir, "events.jsonl",
-		"SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at FROM events ORDER BY created_at ASC, id ASC")
-	if err != nil {
-		return nil, fmt.Errorf("backup events: %w", err)
+	if err := bs.BackupDatabase(ctx, dir); err != nil {
+		// Persist the attempt time even on failure so the throttle
+		// interval (checked by maybeAutoBackup via state.Timestamp)
+		// applies to the next command. Without this, a sync that keeps
+		// failing — e.g. a slow/overloaded shared Dolt server — retries
+		// on EVERY bd command instead of once per interval, turning a
+		// transient slowdown into a self-amplifying storm (the 2026-07
+		// shared-dolt CPU-pin incident). LastDoltCommit is deliberately
+		// left unchanged so change-detection still sees pending work and
+		// a real backup runs once the failure clears.
+		state.Timestamp = time.Now().UTC()
+		if saveErr := saveBackupState(dir, state); saveErr != nil {
+			debug.Logf("backup: failed to persist throttle state after error: %v\n", saveErr)
+		}
+		return nil, err
 	}
-	state.Counts.Events = n
-
-	n, err = exportTable(ctx, store, dir, "comments.jsonl",
-		"SELECT id, issue_id, author, text, created_at FROM comments ORDER BY id")
-	if err != nil {
-		return nil, fmt.Errorf("backup comments: %w", err)
-	}
-	state.Counts.Comments = n
-
-	n, err = exportTable(ctx, store, dir, "dependencies.jsonl",
-		"SELECT issue_id, depends_on_id, type, created_at, created_by, metadata FROM dependencies ORDER BY issue_id, depends_on_id")
-	if err != nil {
-		return nil, fmt.Errorf("backup dependencies: %w", err)
-	}
-	state.Counts.Dependencies = n
-
-	n, err = exportTable(ctx, store, dir, "labels.jsonl",
-		"SELECT issue_id, label FROM labels ORDER BY issue_id, label")
-	if err != nil {
-		return nil, fmt.Errorf("backup labels: %w", err)
-	}
-	state.Counts.Labels = n
-
-	n, err = exportTable(ctx, store, dir, "config.jsonl",
-		"SELECT `key`, value FROM config ORDER BY `key`")
-	if err != nil {
-		return nil, fmt.Errorf("backup config: %w", err)
-	}
-	state.Counts.Config = n
 
 	// Update watermarks
 	currentCommit, err := store.GetCurrentCommit(ctx)
@@ -214,105 +190,4 @@ func truncateHash(h string) string {
 		return h[:8]
 	}
 	return h
-}
-
-// exportTable streams query results to a JSONL file using atomic write (temp file + rename).
-// Uses bounded memory regardless of result set size.
-func exportTable(ctx context.Context, q dbQuerier, dir, filename, query string) (int, error) {
-	rows, err := q.QueryContext(ctx, query)
-	if err != nil {
-		return 0, fmt.Errorf("query failed: %w", err)
-	}
-	defer rows.Close()
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get columns: %w", err)
-	}
-
-	// Write to temp file, then rename atomically for crash safety.
-	tmp, err := os.CreateTemp(dir, ".backup-tmp-*")
-	if err != nil {
-		return 0, fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer func() { _ = os.Remove(tmpPath) }() // cleanup on error path
-
-	w := bufio.NewWriter(tmp)
-	count, err := writeRows(rows, cols, w)
-	if err != nil {
-		_ = tmp.Close()
-		return 0, err
-	}
-
-	if err := w.Flush(); err != nil {
-		_ = tmp.Close()
-		return 0, fmt.Errorf("flush failed: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return 0, fmt.Errorf("sync failed: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return 0, fmt.Errorf("close failed: %w", err)
-	}
-
-	dest := filepath.Join(dir, filename)
-	if err := os.Rename(tmpPath, dest); err != nil {
-		return 0, fmt.Errorf("rename failed: %w", err)
-	}
-	return count, nil
-}
-
-// writeRows scans rows and writes each as a JSON line to w.
-// Allocates scan buffers once and reuses them across all rows.
-func writeRows(rows *sql.Rows, cols []string, w *bufio.Writer) (int, error) {
-	values := make([]interface{}, len(cols))
-	ptrs := make([]interface{}, len(cols))
-	for i := range values {
-		ptrs[i] = &values[i]
-	}
-
-	count := 0
-	for rows.Next() {
-		if err := rows.Scan(ptrs...); err != nil {
-			return 0, fmt.Errorf("scan failed: %w", err)
-		}
-
-		row := make(map[string]interface{}, len(cols))
-		for i, col := range cols {
-			row[col] = normalizeValue(values[i])
-		}
-
-		data, err := json.Marshal(row)
-		if err != nil {
-			return 0, fmt.Errorf("marshal failed: %w", err)
-		}
-		data = append(data, '\n')
-		if _, err := w.Write(data); err != nil {
-			return 0, fmt.Errorf("write failed: %w", err)
-		}
-		count++
-	}
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("row iteration failed: %w", err)
-	}
-	return count, nil
-}
-
-// normalizeValue converts database driver types to JSON-friendly values.
-func normalizeValue(v interface{}) interface{} {
-	switch val := v.(type) {
-	case []byte:
-		return string(val)
-	case time.Time:
-		if val.IsZero() {
-			return nil
-		}
-		return val.Format(time.RFC3339)
-	case nil:
-		return nil
-	default:
-		return val
-	}
 }

@@ -227,6 +227,11 @@ func TestScanForArtifacts_ValidRedirect(t *testing.T) {
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		t.Fatal(err)
 	}
+	// A valid redirect target must have a metadata.json or database
+	// (gastownhall/beads#4692 guard).
+	if err := os.WriteFile(filepath.Join(targetDir, "metadata.json"), []byte(`{"database":"beads.db"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create redirect pointing to valid target
 	if err := os.WriteFile(filepath.Join(beadsDir, "redirect"), []byte(targetDir), 0644); err != nil {
@@ -240,6 +245,41 @@ func TestScanForArtifacts_ValidRedirect(t *testing.T) {
 
 	if len(report.RedirectIssues) != 0 {
 		t.Errorf("expected 0 redirect issues for valid target, got %d", len(report.RedirectIssues))
+	}
+}
+
+// TestScanForArtifacts_RedirectTargetHasNoDatabase is a regression test for
+// gastownhall/beads#4692: a redirect target directory that exists but has no
+// metadata.json and no recognizable database is flagged as an actionable
+// warning (not SafeDelete cruft), matching FollowRedirect's own target-
+// validity guard (internal/beads).
+func TestScanForArtifacts_RedirectTargetHasNoDatabase(t *testing.T) {
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	targetDir := filepath.Join(dir, "target-beads")
+
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// targetDir exists but is empty: no metadata.json, no database.
+
+	if err := os.WriteFile(filepath.Join(beadsDir, "redirect"), []byte(targetDir), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := ScanForArtifacts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(report.RedirectIssues) != 1 {
+		t.Fatalf("expected 1 redirect issue (target has no database), got %d", len(report.RedirectIssues))
+	}
+	if report.RedirectIssues[0].SafeDelete {
+		t.Errorf("expected SafeDelete=false: an invalid-target redirect is an actionable warning, not cruft")
 	}
 }
 
@@ -290,6 +330,43 @@ func TestScanForArtifacts_SkipsGitkeep(t *testing.T) {
 
 	if len(report.CruftBeadsDirs) != 0 {
 		t.Errorf("expected 0 cruft dirs (redirect + .gitkeep only), got %d", len(report.CruftBeadsDirs))
+	}
+}
+
+func TestScanForArtifacts_SkipsGitInternalsButScansBeadsWorktrees(t *testing.T) {
+	dir := t.TempDir()
+
+	// A bogus .beads under .git internals should be ignored entirely.
+	ignoredBeads := filepath.Join(dir, ".git", "objects", "pack", ".beads")
+	if err := os.MkdirAll(ignoredBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ignoredBeads, "beads.db"), []byte("stale"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A worktree .beads under .git/beads-worktrees must still be scanned.
+	worktreeBeads := filepath.Join(dir, ".git", "beads-worktrees", "test", ".beads")
+	if err := os.MkdirAll(worktreeBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreeBeads, "extra.txt"), []byte("cruft"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := ScanForArtifacts(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(report.SQLiteArtifacts) != 0 {
+		t.Fatalf("expected .git internals to be skipped, got %d sqlite findings", len(report.SQLiteArtifacts))
+	}
+	if len(report.CruftBeadsDirs) != 1 {
+		t.Fatalf("expected 1 worktree cruft finding, got %d", len(report.CruftBeadsDirs))
+	}
+	if got := report.CruftBeadsDirs[0].Path; got != worktreeBeads {
+		t.Fatalf("cruft finding path = %q, want %q", got, worktreeBeads)
 	}
 }
 

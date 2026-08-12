@@ -12,7 +12,7 @@ import (
 )
 
 func TestUpdateBeadsSection(t *testing.T) {
-	beadsSection := agents.EmbeddedBeadsSection()
+	beadsSection := agents.RenderSection(agents.ProfileFull)
 
 	tests := []struct {
 		name     string
@@ -38,9 +38,9 @@ Some content
 More content after`,
 		},
 		{
-			name:     "append when no markers exist",
+			name:     "no markers returns content unchanged",
 			content:  "# My Project\n\nSome content",
-			expected: "# My Project\n\nSome content\n\n" + beadsSection,
+			expected: "# My Project\n\nSome content",
 		},
 		{
 			name: "handle section at end of file",
@@ -135,12 +135,16 @@ func TestCreateNewAgentsFile(t *testing.T) {
 		t.Error("Missing header in new agents file")
 	}
 
-	if !strings.Contains(content, agentsBeginMarker) {
+	if !containsBeadsMarker(content) {
 		t.Error("Missing begin marker in new agents file")
 	}
 
 	if !strings.Contains(content, agentsEndMarker) {
 		t.Error("Missing end marker in new agents file")
+	}
+
+	if !strings.Contains(content, "profile:full") {
+		t.Error("Missing profile metadata in new agents file")
 	}
 
 	if !strings.Contains(content, "## Build & Test") {
@@ -183,7 +187,7 @@ func TestInstallFactoryCreatesNewFile(t *testing.T) {
 		t.Fatalf("failed to read AGENTS.md: %v", err)
 	}
 	content := string(data)
-	if !strings.Contains(content, agentsBeginMarker) || !strings.Contains(content, agentsEndMarker) {
+	if !containsBeadsMarker(content) || !strings.Contains(content, agentsEndMarker) {
 		t.Fatal("missing factory markers in new file")
 	}
 	if !strings.Contains(stdout.String(), "Factory.ai (Droid) integration installed") {
@@ -233,6 +237,8 @@ func TestInstallFactoryReportsWriteError(t *testing.T) {
 }
 
 func TestCheckFactoryScenarios(t *testing.T) {
+	stubDetectRenderOpts(t)
+
 	t.Run("missing file", func(t *testing.T) {
 		env, stdout, _ := newFactoryTestEnv(t)
 		err := checkFactory(env)
@@ -260,7 +266,8 @@ func TestCheckFactoryScenarios(t *testing.T) {
 
 	t.Run("success", func(t *testing.T) {
 		env, stdout, _ := newFactoryTestEnv(t)
-		beadsSection := agents.EmbeddedBeadsSection()
+		// Use current rendered section (not legacy EmbeddedBeadsSection) so check reports "current"
+		beadsSection := agents.RenderSection(agents.ProfileFull)
 		if err := os.WriteFile(env.agentsPath, []byte(beadsSection), 0644); err != nil {
 			t.Fatalf("failed to seed file: %v", err)
 		}
@@ -269,6 +276,21 @@ func TestCheckFactoryScenarios(t *testing.T) {
 		}
 		if !strings.Contains(stdout.String(), "integration installed") {
 			t.Error("expected success output")
+		}
+	})
+
+	t.Run("stale legacy section", func(t *testing.T) {
+		env, stdout, _ := newFactoryTestEnv(t)
+		beadsSection := agents.EmbeddedBeadsSection()
+		if err := os.WriteFile(env.agentsPath, []byte(beadsSection), 0644); err != nil {
+			t.Fatalf("failed to seed file: %v", err)
+		}
+		err := checkFactory(env)
+		if !errors.Is(err, errBeadsSectionStale) {
+			t.Fatalf("expected errBeadsSectionStale, got %v", err)
+		}
+		if !strings.Contains(stdout.String(), "stale") {
+			t.Error("expected stale output")
 		}
 	})
 }
@@ -328,32 +350,27 @@ func TestRemoveFactoryScenarios(t *testing.T) {
 	})
 }
 
-func TestWrapperExitsOnError(t *testing.T) {
+func TestWrapperReturnsErrorOnFailure(t *testing.T) {
 	t.Run("InstallFactory", func(t *testing.T) {
-		cap := stubSetupExit(t)
 		env := factoryEnv{agentsPath: filepath.Join(t.TempDir(), "dir"), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
 		if err := os.Mkdir(env.agentsPath, 0o755); err != nil {
 			t.Fatalf("failed to create directory: %v", err)
 		}
 		stubFactoryEnvProvider(t, env)
-		InstallFactory()
-		if !cap.called || cap.code != 1 {
-			t.Fatal("InstallFactory should exit on error")
+		if err := InstallFactory(); err == nil {
+			t.Fatal("InstallFactory should return error")
 		}
 	})
 
 	t.Run("CheckFactory", func(t *testing.T) {
-		cap := stubSetupExit(t)
 		env := factoryEnv{agentsPath: filepath.Join(t.TempDir(), "missing"), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
 		stubFactoryEnvProvider(t, env)
-		CheckFactory()
-		if !cap.called || cap.code != 1 {
-			t.Fatal("CheckFactory should exit on error")
+		if err := CheckFactory(); err == nil {
+			t.Fatal("CheckFactory should return error")
 		}
 	})
 
 	t.Run("RemoveFactory", func(t *testing.T) {
-		cap := stubSetupExit(t)
 		env := factoryEnv{agentsPath: filepath.Join(t.TempDir(), "AGENTS.md"), stdout: &bytes.Buffer{}, stderr: &bytes.Buffer{}}
 		beadsSection := agents.EmbeddedBeadsSection()
 		if err := os.WriteFile(env.agentsPath, []byte(beadsSection), 0644); err != nil {
@@ -363,9 +380,8 @@ func TestWrapperExitsOnError(t *testing.T) {
 			t.Fatalf("failed to chmod file: %v", err)
 		}
 		stubFactoryEnvProvider(t, env)
-		RemoveFactory()
-		if !cap.called || cap.code != 1 {
-			t.Fatal("RemoveFactory should exit on error")
+		if err := RemoveFactory(); err == nil {
+			t.Fatal("RemoveFactory should return error")
 		}
 	})
 }
@@ -419,8 +435,8 @@ func TestRoundTripAddRemoveLeavesNoBeadsContent(t *testing.T) {
 	if !strings.Contains(withBeads, "BEGIN BEADS INTEGRATION") {
 		t.Fatal("beads markers should be present after adding section")
 	}
-	if !strings.Contains(withBeads, "Landing the Plane") {
-		t.Fatal("landing-the-plane should be present inside beads section")
+	if !strings.Contains(withBeads, "Session Completion") {
+		t.Fatal("session-completion should be present inside beads section")
 	}
 
 	// Remove the beads section
@@ -433,8 +449,8 @@ func TestRoundTripAddRemoveLeavesNoBeadsContent(t *testing.T) {
 	if strings.Contains(cleaned, "END BEADS INTEGRATION") {
 		t.Error("end marker should not remain after removal")
 	}
-	if strings.Contains(cleaned, "Landing the Plane") {
-		t.Error("landing-the-plane should not remain after removal (must be inside markers)")
+	if strings.Contains(cleaned, "Session Completion") {
+		t.Error("session-completion should not remain after removal (must be inside markers)")
 	}
 	if strings.Contains(cleaned, "bd ready") {
 		t.Error("beads commands should not remain after removal")

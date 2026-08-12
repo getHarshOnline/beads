@@ -5,8 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/steveyegge/beads/internal/lockfile"
 )
 
 // TestRunDoltHealthChecks_NonDoltBackend was removed: SQLite backend no longer
@@ -14,9 +12,53 @@ import (
 // (bd-yqpwy)
 
 func TestRunDoltHealthChecks_DoltBackendNoServer(t *testing.T) {
-	// Server-only mode: without a running dolt sql-server, the connection
-	// check should return StatusError and all 6 checks should be present
-	// (consistent return shape regardless of connection success/failure).
+	// GH#2722: In owned/embedded mode (non-external), when no server is
+	// running, server-dependent checks should be skipped gracefully (StatusOK)
+	// instead of reporting false errors. The embedded SharedStore checks
+	// already cover data integrity.
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("failed to create beads dir: %v", err)
+	}
+
+	// Write metadata.json marking this as dolt backend (no explicit server port → owned mode)
+	configContent := []byte(`{"backend":"dolt"}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), configContent, 0o644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	// No BEADS_DOLT_SERVER_PORT set → port 0 → no server running
+	// No BEADS_DOLT_SHARED_SERVER → owned mode (not external)
+	checks := RunDoltHealthChecks(tmpDir)
+	if len(checks) != 7 {
+		t.Fatalf("expected exactly 7 checks (consistent shape), got %d", len(checks))
+	}
+
+	// Verify check names are consistent
+	expectedNames := []string{"Dolt Connection", "Dolt Schema", "Dolt Issue Count", "Dolt Status", "Dolt Lock Health", "Phantom Databases", "Shared Server"}
+	for i, name := range expectedNames {
+		if checks[i].Name != name {
+			t.Errorf("checks[%d].Name = %q, want %q", i, checks[i].Name, name)
+		}
+	}
+
+	// Server-dependent checks should be OK (gracefully skipped), not errors
+	for _, idx := range []int{0, 1, 2, 3, 5} {
+		if checks[idx].Status != StatusOK {
+			t.Errorf("checks[%d] (%s): expected StatusOK (graceful skip), got %s: %s",
+				idx, checks[idx].Name, checks[idx].Status, checks[idx].Message)
+		}
+		if !strings.Contains(checks[idx].Message, "no server running") {
+			t.Errorf("checks[%d] (%s): expected skip message about no server, got %q",
+				idx, checks[idx].Name, checks[idx].Message)
+		}
+	}
+}
+
+func TestRunDoltHealthChecks_ExternalModeNoServer(t *testing.T) {
+	// In external/shared server mode, a server IS expected to be running,
+	// so connection failure should report real errors.
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
@@ -29,8 +71,9 @@ func TestRunDoltHealthChecks_DoltBackendNoServer(t *testing.T) {
 		t.Fatalf("failed to write config: %v", err)
 	}
 
-	// Point at a port nothing listens on to ensure connection fails
+	// Point at a port nothing listens on AND set server mode to external
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "59998")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "1")
 
 	checks := RunDoltHealthChecks(tmpDir)
 	if len(checks) != 7 {
@@ -41,15 +84,7 @@ func TestRunDoltHealthChecks_DoltBackendNoServer(t *testing.T) {
 		t.Errorf("expected first check to be 'Dolt Connection', got %q", checks[0].Name)
 	}
 	if checks[0].Status != StatusError {
-		t.Errorf("expected StatusError (no server running), got %s: %s", checks[0].Status, checks[0].Message)
-	}
-
-	// Verify placeholder checks for dimensions that require a connection
-	expectedNames := []string{"Dolt Connection", "Dolt Schema", "Dolt Issue Count", "Dolt Status", "Dolt Lock Health", "Phantom Databases", "Shared Server"}
-	for i, name := range expectedNames {
-		if checks[i].Name != name {
-			t.Errorf("checks[%d].Name = %q, want %q", i, checks[i].Name, name)
-		}
+		t.Errorf("expected StatusError (external server unreachable), got %s: %s", checks[0].Status, checks[0].Message)
 	}
 
 	// Schema, Issue Count, Status, and Phantom Databases should be StatusError with skip message
@@ -87,7 +122,7 @@ func TestRunDoltHealthChecks_CheckNameAndCategory(t *testing.T) {
 
 func TestServerMode_NoLockAcquired(t *testing.T) {
 	// Server-only mode never acquires advisory locks.
-	// We force a non-listening port so the connection always fails.
+	// We force a non-listening port in external mode so the connection always fails.
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
 	doltDir := filepath.Join(beadsDir, "dolt")
@@ -101,6 +136,7 @@ func TestServerMode_NoLockAcquired(t *testing.T) {
 	}
 
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "59999")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "1") // External mode: server expected
 
 	checks := RunDoltHealthChecks(tmpDir)
 	if len(checks) != 7 {
@@ -114,106 +150,9 @@ func TestServerMode_NoLockAcquired(t *testing.T) {
 		t.Errorf("expected StatusError (server unreachable), got %s", check.Status)
 	}
 
-	// The error should NOT be about lock acquisition
-	if strings.Contains(check.Detail, "access lock") {
-		t.Errorf("should not attempt lock acquisition, but Detail contains %q: %s",
-			"access lock", check.Detail)
-	}
-
-	// Verify no lock file was created
-	lockPath := filepath.Join(beadsDir, "dolt-access.lock")
-	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
-		t.Errorf("lock file should not exist, but found at %s", lockPath)
-	}
 }
 
-func TestCheckLockHealth_NoIssues(t *testing.T) {
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	if err := os.MkdirAll(doltDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	configContent := []byte(`{"backend":"dolt"}`)
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), configContent, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	check := CheckLockHealth(tmpDir)
-	if check.Status != StatusOK {
-		t.Errorf("expected OK status, got %s: %s", check.Status, check.Message)
-	}
-}
-
-func TestCheckLockHealth_UnlockedNomsLOCK(t *testing.T) {
-	// A noms LOCK file that is NOT flock'd should not produce a warning.
-	// This is the common case: a previous bd process created the file,
-	// released the flock on close, but the file persists on disk.
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	nomsDir := filepath.Join(beadsDir, "dolt", "beads", ".dolt", "noms")
-	if err := os.MkdirAll(nomsDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	configContent := []byte(`{"backend":"dolt"}`)
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), configContent, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	lockPath := filepath.Join(nomsDir, "LOCK")
-	if err := os.WriteFile(lockPath, []byte(""), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	check := CheckLockHealth(tmpDir)
-	if check.Status != StatusOK {
-		t.Errorf("expected OK status with unlocked noms LOCK file, got %s (detail: %s)", check.Status, check.Detail)
-	}
-}
-
-func TestCheckLockHealth_HeldNomsLOCK(t *testing.T) {
-	// A noms LOCK file that IS flock'd should produce a warning —
-	// another process is actively using the database.
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	nomsDir := filepath.Join(beadsDir, "dolt", "beads", ".dolt", "noms")
-	if err := os.MkdirAll(nomsDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	configContent := []byte(`{"backend":"dolt"}`)
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), configContent, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	lockPath := filepath.Join(nomsDir, "LOCK")
-	if err := os.WriteFile(lockPath, []byte(""), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// Hold an exclusive flock on the LOCK file to simulate an active dolt process
-	f, err := os.OpenFile(lockPath, os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if err := lockfile.FlockExclusiveNonBlocking(f); err != nil {
-		t.Fatalf("failed to acquire flock: %v", err)
-	}
-	defer func() { _ = lockfile.FlockUnlock(f) }()
-
-	check := CheckLockHealth(tmpDir)
-	if check.Status != StatusWarning {
-		t.Errorf("expected Warning status with held noms LOCK, got %s", check.Status)
-	}
-	if !strings.Contains(check.Detail, "noms LOCK") {
-		t.Errorf("expected detail to mention noms LOCK, got: %s", check.Detail)
-	}
-}
-
-func TestIsWispTable(t *testing.T) {
+func TestIsIgnoredTable(t *testing.T) {
 	tests := []struct {
 		name     string
 		table    string
@@ -224,8 +163,11 @@ func TestIsWispTable(t *testing.T) {
 		{"wisp_labels", "wisp_labels", true},
 		{"wisp_dependencies", "wisp_dependencies", true},
 		{"wisp_comments", "wisp_comments", true},
+		{"leases", "leases", true},
+		{"local_metadata", "local_metadata", true},
+		{"repo_mtimes", "repo_mtimes", true},
+		{"events", "events", true},
 		{"issues table", "issues", false},
-		{"events table", "events", false},
 		{"labels table", "labels", false},
 		{"dependencies table", "dependencies", false},
 		{"config table", "config", false},
@@ -235,28 +177,73 @@ func TestIsWispTable(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isWispTable(tt.table); got != tt.expected {
-				t.Errorf("isWispTable(%q) = %v, want %v", tt.table, got, tt.expected)
+			if got := isIgnoredTable(tt.table); got != tt.expected {
+				t.Errorf("isIgnoredTable(%q) = %v, want %v", tt.table, got, tt.expected)
 			}
 		})
 	}
 }
 
-func TestCheckLockHealth_NonDoltBackend(t *testing.T) {
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
-		t.Fatal(err)
+// TestDescribeUncommittedTables_FiltersIgnored is the regression test for the
+// skip-list drift (#5260). Both uncommitted-changes checks — "Dolt Status" and
+// "Dolt Locks" — now share this one filter, so a table that is benign for one
+// cannot be a permanent warning on the other.
+func TestDescribeUncommittedTables_FiltersIgnored(t *testing.T) {
+	rows := []doltStatusRow{
+		{table: "wisps", status: "modified"},
+		{table: "wisp_events", status: "modified"},
+		{table: "leases", status: "modified"},
+		{table: "local_metadata", status: "modified"},
+		{table: "repo_mtimes", status: "modified"},
+		{table: "events", status: "modified"},
+		{table: "issues", status: "modified", staged: true},
+		{table: "labels", status: "modified"},
 	}
 
-	// Write SQLite backend config
-	configContent := []byte(`{"backend":"sqlite"}`)
-	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), configContent, 0o644); err != nil {
-		t.Fatal(err)
+	got := describeUncommittedTables(rows)
+
+	want := []string{"issues: modified (staged)", "labels: modified"}
+	if len(got) != len(want) {
+		t.Fatalf("describeUncommittedTables() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("describeUncommittedTables()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// TestDescribeUncommittedTables_AllIgnoredIsClean pins the property the bug
+// report turned on: a store whose only dirty tables are dolt_ignore'd must read
+// as clean, not as a warning that can never be cleared.
+func TestDescribeUncommittedTables_AllIgnoredIsClean(t *testing.T) {
+	rows := []doltStatusRow{
+		{table: "wisps", status: "modified"},
+		{table: "wisp_dependencies", status: "new table"},
+		{table: "leases", status: "modified"},
+		{table: "events", status: "modified"},
 	}
 
-	check := CheckLockHealth(tmpDir)
-	if check.Status != StatusOK {
-		t.Errorf("expected OK for non-Dolt backend, got %s", check.Status)
+	if got := describeUncommittedTables(rows); len(got) != 0 {
+		t.Errorf("describeUncommittedTables() = %v, want empty (all tables are dolt_ignore'd)", got)
+	}
+}
+
+// TestDoltLocksAndDoltStatusShareOneFilter is the anti-drift guard. The two
+// checks previously kept independent skip-lists that diverged; if a future
+// change reintroduces a second private filter, the shared helper stops being
+// the only path and this test is the place that should start failing.
+func TestDoltLocksAndDoltStatusShareOneFilter(t *testing.T) {
+	// Tables that were reported dirty by "Dolt Locks" but not by "Dolt Status"
+	// before #5260, because checkDoltLocks skipped only wisp tables.
+	previouslyDivergent := []string{"leases", "local_metadata", "repo_mtimes", "events"}
+
+	for _, table := range previouslyDivergent {
+		if !isIgnoredTable(table) {
+			t.Errorf("isIgnoredTable(%q) = false; the shared filter must cover every table both checks ignore", table)
+		}
+		if got := describeUncommittedTables([]doltStatusRow{{table: table, status: "modified"}}); len(got) != 0 {
+			t.Errorf("describeUncommittedTables(%q) = %v, want empty", table, got)
+		}
 	}
 }

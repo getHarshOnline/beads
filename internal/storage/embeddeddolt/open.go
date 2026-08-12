@@ -1,4 +1,4 @@
-//go:build embeddeddolt
+//go:build cgo
 
 package embeddeddolt
 
@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
-	doltembed "github.com/dolthub/driver"
+	doltembed "github.com/dolthub/driver/v2"
 )
 
 // validIdentifier matches safe SQL identifiers (letters, digits, underscores).
@@ -48,8 +48,8 @@ func OpenSQL(ctx context.Context, dir, database, branch string) (*sql.DB, func()
 	}
 
 	db := sql.OpenDB(connector)
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(2)
 	db.SetConnMaxIdleTime(0)
 	db.SetConnMaxLifetime(0)
 
@@ -76,8 +76,11 @@ func OpenSQL(ctx context.Context, dir, database, branch string) (*sql.DB, func()
 
 	if strings.TrimSpace(database) != "" {
 		if !validIdentifier.MatchString(database) {
-			return nil, nil, errors.Join(
-				fmt.Errorf("invalid database name: %q", database), cleanup())
+			msg := fmt.Sprintf("invalid database name: %q", database)
+			if strings.ContainsRune(database, '-') {
+				msg += "; hyphens are not allowed in embedded mode — replace with underscores in .beads/metadata.json dolt_database field, or run 'bd doctor'"
+			}
+			return nil, nil, errors.Join(errors.New(msg), cleanup())
 		}
 		if _, err := db.ExecContext(ctx, "USE `"+database+"`"); err != nil {
 			return nil, nil, errors.Join(err, cleanup())
@@ -100,15 +103,16 @@ func buildDSN(dir, database string) string {
 	if strings.TrimSpace(database) != "" {
 		v.Set(doltembed.DatabaseParam, database)
 	}
-	u := url.URL{Scheme: "file", Path: encodeDir(dir), RawQuery: v.Encode()}
-	return u.String()
-}
-
-func encodeDir(dir string) string {
+	// Build the DSN string manually instead of using url.URL.String(),
+	// which percent-encodes the path (spaces → %20). The embedded Dolt
+	// driver's ParseDataSource strips the "file://" prefix and uses the
+	// remainder as a literal filesystem path, so encoding breaks paths
+	// that contain spaces. See #2920.
+	path := dir
 	if os.PathSeparator == '\\' {
-		return strings.ReplaceAll(dir, `\`, `/`)
+		path = strings.ReplaceAll(path, `\`, `/`)
 	}
-	return dir
+	return "file://" + path + "?" + v.Encode()
 }
 
 func sqlStringLiteral(s string) string {

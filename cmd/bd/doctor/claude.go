@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+var latestPyPIVersionFetcher = fetchLatestPyPIVersion
+
 // CheckClaude returns Claude integration verification as a DoctorCheck.
 // repoPath is the project root directory.
 func CheckClaude(repoPath string) DoctorCheck {
@@ -52,7 +54,7 @@ func CheckClaude(repoPath string) DoctorCheck {
 			Detail: "MCP-only mode: relies on tools for every query (~10.5k tokens)\n" +
 				"  bd prime hooks provide much better token efficiency",
 			Fix: "Add bd prime hooks for better token efficiency:\n" +
-				"  1. Run 'bd setup claude' to add SessionStart/PreCompact hooks\n" +
+				"  1. Run 'bd setup claude' to add SessionStart hooks\n" +
 				"\n" +
 				"Benefits:\n" +
 				"  • MCP mode: ~50 tokens vs ~10.5k for full tool scan (99% reduction)\n" +
@@ -80,10 +82,10 @@ func CheckClaude(repoPath string) DoctorCheck {
 			Fix: "Set up Claude integration:\n" +
 				"  Option 1: Install the beads plugin (recommended)\n" +
 				"    • Provides hooks, slash commands, and MCP tools automatically\n" +
-				"    • See: https://github.com/steveyegge/beads/blob/main/docs/PLUGIN.md\n" +
+				"    • See: https://github.com/gastownhall/beads/blob/main/docs/integrations/claude-code-plugin.md\n" +
 				"\n" +
 				"  Option 2: CLI-only mode\n" +
-				"    • Run 'bd setup claude' to add SessionStart/PreCompact hooks\n" +
+				"    • Run 'bd setup claude' to add SessionStart hooks\n" +
 				"    • No slash commands, but hooks provide workflow context\n" +
 				"\n" +
 				"Benefits:\n" +
@@ -268,7 +270,9 @@ func hasBeadsHooks(settingsPath string) bool {
 					continue
 				}
 				cmdStr, _ := cmdMap["command"].(string)
-				if cmdStr == "bd prime" || cmdStr == "bd prime --stealth" {
+				switch cmdStr {
+				case "bd prime", "bd prime --stealth",
+					"bd prime --hook-json", "bd prime --stealth --hook-json":
 					return true
 				}
 			}
@@ -353,19 +357,12 @@ func CheckBdInPath() DoctorCheck {
 	}
 }
 
-// CheckDocumentationBdPrimeReference checks if AGENTS.md or CLAUDE.md reference 'bd prime'
+// CheckDocumentationBdPrimeReference checks if the agents file or CLAUDE.md reference 'bd prime'
 // and verifies the command exists. This helps catch version mismatches where docs
 // reference features not available in the installed version.
 // Also supports local-only variants (claude.local.md) that are gitignored.
 func CheckDocumentationBdPrimeReference(repoPath string) DoctorCheck {
-	docFiles := []string{
-		filepath.Join(repoPath, "AGENTS.md"),
-		filepath.Join(repoPath, "CLAUDE.md"),
-		filepath.Join(repoPath, ".claude", "CLAUDE.md"),
-		// Local-only variants (not committed to repo)
-		filepath.Join(repoPath, "claude.local.md"),
-		filepath.Join(repoPath, ".claude", "claude.local.md"),
-	}
+	docFiles := agentDocFiles(repoPath)
 
 	var filesWithBdPrime []string
 	for _, docFile := range docFiles {
@@ -456,12 +453,12 @@ func CheckClaudePlugin() DoctorCheck {
 			Name:    "Claude Plugin",
 			Status:  StatusWarning,
 			Message: "beads plugin not installed",
-			Fix:     "Install plugin: /plugin marketplace add steveyegge/beads && /plugin install beads (see docs/PLUGIN.md)",
+			Fix:     "Install plugin: /plugin marketplace add steveyegge/beads && /plugin install beads (see docs/integrations/claude-code-plugin.md)",
 		}
 	}
 
 	// Query PyPI for latest MCP version
-	latestMCPVersion, err := fetchLatestPyPIVersion("beads-mcp")
+	latestMCPVersion, err := latestPyPIVersionFetcher("beads-mcp")
 	if err != nil {
 		// Network error - don't fail
 		return DoctorCheck{
@@ -493,6 +490,43 @@ func CheckClaudePlugin() DoctorCheck {
 		Name:    "Claude Plugin",
 		Status:  StatusOK,
 		Message: fmt.Sprintf("version %s", pluginVersion),
+	}
+}
+
+// CheckClaudePluginLocalOnly validates local Claude plugin presence/version
+// without contacting PyPI.
+func CheckClaudePluginLocalOnly() DoctorCheck {
+	if os.Getenv("CLAUDECODE") != "1" || !isClaudePresent() {
+		return DoctorCheck{
+			Name:    "Claude Plugin",
+			Status:  StatusOK,
+			Message: "N/A (not running in Claude Code)",
+		}
+	}
+
+	pluginVersion, pluginInstalled, err := GetClaudePluginVersion()
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Claude Plugin",
+			Status:  StatusWarning,
+			Message: "Unable to check plugin version",
+			Detail:  err.Error(),
+		}
+	}
+
+	if !pluginInstalled {
+		return DoctorCheck{
+			Name:    "Claude Plugin",
+			Status:  StatusWarning,
+			Message: "beads plugin not installed",
+			Fix:     "Install plugin: /plugin marketplace add steveyegge/beads && /plugin install beads (see docs/integrations/claude-code-plugin.md)",
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "Claude Plugin",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("version %s (update check skipped in non-interactive mode)", pluginVersion),
 	}
 }
 
@@ -666,9 +700,10 @@ func CheckClaudeSettingsHealth(repoPath string) DoctorCheck {
 	}
 }
 
-// CheckClaudeHookCompleteness verifies that when hooks are installed, both
-// SessionStart and PreCompact events are covered. Having only one means
-// context injection works on session start but not after compaction (or vice versa).
+// CheckClaudeHookCompleteness verifies that when hooks are installed,
+// SessionStart is covered. Claude Code fires SessionStart on startup, resume,
+// clear, and after compaction, so current bd prime context injection only needs
+// SessionStart.
 // repoPath is the project root directory.
 func CheckClaudeHookCompleteness(repoPath string) DoctorCheck {
 	home, err := os.UserHomeDir()
@@ -686,9 +721,8 @@ func CheckClaudeHookCompleteness(repoPath string) DoctorCheck {
 		filepath.Join(repoPath, ".claude", "settings.local.json"),
 	}
 
-	// Check if any settings file has hooks at all
 	var hasAnyHook bool
-	var hasSessionStart, hasPreCompact bool
+	var hasSessionStart bool
 
 	for _, sf := range settingsFiles {
 		ss, pc := checkHookEvents(sf)
@@ -697,9 +731,6 @@ func CheckClaudeHookCompleteness(repoPath string) DoctorCheck {
 		}
 		if ss {
 			hasSessionStart = true
-		}
-		if pc {
-			hasPreCompact = true
 		}
 	}
 
@@ -712,30 +743,20 @@ func CheckClaudeHookCompleteness(repoPath string) DoctorCheck {
 		}
 	}
 
-	if hasSessionStart && hasPreCompact {
+	if hasSessionStart {
 		return DoctorCheck{
 			Name:    "Claude Hook Completeness",
 			Status:  StatusOK,
-			Message: "Both SessionStart and PreCompact hooks present",
+			Message: "SessionStart hook present",
 		}
-	}
-
-	var missing []string
-	if !hasSessionStart {
-		missing = append(missing, "SessionStart")
-	}
-	if !hasPreCompact {
-		missing = append(missing, "PreCompact")
 	}
 
 	return DoctorCheck{
 		Name:    "Claude Hook Completeness",
 		Status:  StatusWarning,
-		Message: fmt.Sprintf("Missing hook event(s): %s", strings.Join(missing, ", ")),
-		Detail: "SessionStart injects context on new sessions.\n" +
-			"PreCompact preserves context before compaction.\n" +
-			"Both are needed for reliable workflow context.",
-		Fix: "Run 'bd setup claude' to install both hooks, or\n" +
+		Message: "Missing hook event(s): SessionStart",
+		Detail:  "SessionStart injects context on new sessions and after compaction.",
+		Fix: "Run 'bd setup claude' to install hooks, or\n" +
 			"install the beads plugin which includes hooks automatically.",
 	}
 }
@@ -777,7 +798,9 @@ func checkHookEvents(settingsPath string) (hasSessionStart, hasPreCompact bool) 
 					continue
 				}
 				cmdStr, _ := cmdMap["command"].(string)
-				if cmdStr == "bd prime" || cmdStr == "bd prime --stealth" {
+				switch cmdStr {
+				case "bd prime", "bd prime --stealth",
+					"bd prime --hook-json", "bd prime --stealth --hook-json":
 					return true
 				}
 			}

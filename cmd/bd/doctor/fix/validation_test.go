@@ -10,25 +10,40 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/testutil"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 // fixTestServerPort returns the Dolt server port for fix tests.
-// Returns 0 when BEADS_DOLT_PORT is unset so callers fail safely
-// instead of accidentally connecting to a production server on 3307.
+// Uses DoltContainerPortInt so the port is only non-zero when TestMain
+// actually started a container, ignoring any external BEADS_DOLT_PORT.
 func fixTestServerPort() int {
-	if p := os.Getenv("BEADS_DOLT_PORT"); p != "" {
-		if port, _ := strconv.Atoi(p); port > 0 {
-			return port
-		}
+	return testutil.DoltContainerPortInt()
+}
+
+// requireFixDoltContainer enforces the Dolt test container precondition for
+// the DB-backed fix tests. Locally a missing container skips, so contributors
+// without Docker stay green. A CI job that sets BEADS_FIX_REQUIRE_DOLT=1
+// (after pulling the Dolt image) turns the missing container into a hard
+// failure instead — the guard that keeps this suite from silently going dark
+// again (bd-nxt5e: every DB-backed test here skipped for months, locally and
+// in CI, with nothing noticing). Once the container IS up, dolt.New failures
+// must be t.Fatal, never t.Skip.
+func requireFixDoltContainer(t *testing.T) {
+	t.Helper()
+	if fixTestServerPort() != 0 {
+		return
 	}
-	return 0
+	if os.Getenv("BEADS_FIX_REQUIRE_DOLT") == "1" {
+		t.Fatal("Dolt test container unavailable but BEADS_FIX_REQUIRE_DOLT=1; the fix-package DB suite must not silently skip")
+	}
+	t.Skip("skipping: Dolt test container not available")
 }
 
 // newFixTestStore creates a DoltStore for fix package tests with proper
@@ -37,7 +52,7 @@ func newFixTestStore(t *testing.T, dir string, prefix string) *dolt.DoltStore {
 	t.Helper()
 	ctx := context.Background()
 
-	// Determine server port
+	requireFixDoltContainer(t)
 	port := fixTestServerPort()
 
 	// Generate unique database name for test isolation
@@ -50,6 +65,12 @@ func newFixTestStore(t *testing.T, dir string, prefix string) *dolt.DoltStore {
 		t.Fatalf("Failed to create .beads: %v", err)
 	}
 
+	// project_id matched between metadata.json and the database so
+	// verifyFixTargetIdentity (mybd-2qegi) doesn't reject these fix calls as
+	// unverifiable targets. Mismatch/unverifiable-target cases get their own
+	// tests below.
+	projectID := configfile.GenerateProjectID()
+
 	// Write metadata.json so openAnyDB can connect to the same database
 	cfg := &configfile.Config{
 		Database:       "dolt",
@@ -57,26 +78,35 @@ func newFixTestStore(t *testing.T, dir string, prefix string) *dolt.DoltStore {
 		DoltServerHost: "127.0.0.1",
 		DoltServerPort: port,
 		DoltDatabase:   dbName,
+		ProjectID:      projectID,
 	}
 	if err := cfg.Save(beadsDir); err != nil {
 		t.Fatalf("Failed to write metadata.json: %v", err)
 	}
 
-	// Create store connected to the same database
+	// Create store connected to the same database. CreateIfMissing is
+	// required: the per-test database does not exist yet, and dolt.New's
+	// create-guard refuses to create it implicitly (bd-nxt5e — its absence
+	// made every test using this helper skip).
 	dbPath := filepath.Join(beadsDir, "beads.db")
 	store, err := dolt.New(ctx, &dolt.Config{
-		Path:       dbPath,
-		ServerHost: "127.0.0.1",
-		ServerPort: port,
-		Database:   dbName,
+		Path:            dbPath,
+		ServerHost:      "127.0.0.1",
+		ServerPort:      port,
+		Database:        dbName,
+		CreateIfMissing: true,
 	})
 	if err != nil {
-		t.Skipf("skipping: Dolt not available: %v", err)
+		t.Fatalf("dolt.New against running test container: %v", err)
 	}
 
 	if err := store.SetConfig(ctx, "issue_prefix", prefix); err != nil {
 		store.Close()
 		t.Fatalf("Failed to set issue_prefix: %v", err)
+	}
+	if err := store.SetMetadata(ctx, "_project_id", projectID); err != nil {
+		store.Close()
+		t.Fatalf("Failed to set _project_id metadata: %v", err)
 	}
 
 	t.Cleanup(func() {
@@ -88,7 +118,7 @@ func newFixTestStore(t *testing.T, dir string, prefix string) *dolt.DoltStore {
 
 // dropFixTestDatabase drops a test database (best-effort cleanup).
 func dropFixTestDatabase(dbName string, port int) {
-	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%d)/?parseTime=true&timeout=5s", port)
+	dsn := doltutil.ServerDSN{Host: "127.0.0.1", Port: port, User: "root"}.String()
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return

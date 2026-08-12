@@ -103,11 +103,10 @@ func ScanForArtifacts(rootPath string) (ArtifactReport, error) {
 			return nil // Skip directories we can't read
 		}
 
-		// Skip .git directories (but not .git/beads-worktrees)
 		base := filepath.Base(path)
 		if base == ".git" && info.IsDir() {
-			// Allow descent into .git to find beads-worktrees
-			return nil
+			scanGitWorktreeArtifacts(path, &report)
+			return filepath.SkipDir
 		}
 
 		// Skip node_modules and similar
@@ -147,6 +146,28 @@ func ScanForArtifacts(rootPath string) (ArtifactReport, error) {
 	return report, nil
 }
 
+// scanGitWorktreeArtifacts scans the git-managed worktree area only.
+// This avoids traversing the entire .git directory tree, which can be large and
+// is unrelated to classic beads artifact cleanup.
+func scanGitWorktreeArtifacts(gitDir string, report *ArtifactReport) {
+	worktreesDir := filepath.Join(gitDir, "beads-worktrees")
+	info, err := os.Stat(worktreesDir)
+	if err != nil || !info.IsDir() {
+		return
+	}
+
+	_ = filepath.Walk(worktreesDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() || filepath.Base(path) != ".beads" {
+			return nil
+		}
+		scanBeadsDir(path, report)
+		return filepath.SkipDir
+	})
+}
+
 // scanBeadsDir checks a single .beads directory for artifacts.
 func scanBeadsDir(beadsDir string, report *ArtifactReport) {
 	// Check if this should be a redirect-only directory
@@ -170,28 +191,30 @@ func scanBeadsDir(beadsDir string, report *ArtifactReport) {
 }
 
 // isRedirectExpectedDir returns true if this .beads directory should contain
-// only a redirect file (i.e., it's in a worktree, polecat, crew, or refinery subdirectory).
+// only a redirect file (i.e., it's in a worktree or orchestrator subdirectory).
+// NOTE: The polecats/crew/refinery patterns are retained for backwards compatibility
+// with existing orchestrator installations.
 func isRedirectExpectedDir(beadsDir string) bool {
 	// The parent of .beads is the project dir
 	// We need to determine if this is a "leaf" .beads that should redirect
-	// to a "canonical" .beads (typically in mayor/rig/ or main worktree)
+	// to a "canonical" .beads (typically in the main rig or main worktree)
 
 	parent := filepath.Dir(beadsDir)
 	parentName := filepath.Base(parent)
 	grandparent := filepath.Dir(parent)
 	grandparentName := filepath.Base(grandparent)
 
-	// Pattern: */polecats/*/.beads/ (polecat worktree)
+	// Pattern: */polecats/*/.beads/ (orchestrator worker worktree — backwards compat)
 	if grandparentName == "polecats" {
 		return true
 	}
 
-	// Pattern: */crew/*/.beads/ (crew workspace)
+	// Pattern: */crew/*/.beads/ (orchestrator assistant workspace — backwards compat)
 	if grandparentName == "crew" {
 		return true
 	}
 
-	// Pattern: */refinery/rig/.beads/ (refinery rig)
+	// Pattern: */refinery/rig/.beads/ (orchestrator processor — backwards compat)
 	if parentName == "rig" && grandparentName == "refinery" {
 		return true
 	}
@@ -201,7 +224,7 @@ func isRedirectExpectedDir(beadsDir string) bool {
 		return true
 	}
 
-	// Check if this is a rig-root .beads/ (e.g., gastown/.beads/)
+	// Check if this is a rig-root .beads/ (e.g., my-project/.beads/)
 	// that should redirect to mayor/rig/.beads/
 	// A rig-root .beads has a sibling "mayor/" or "polecats/" directory
 	if hasSibling(parent, "mayor") || hasSibling(parent, "polecats") {
@@ -373,5 +396,48 @@ func validateRedirect(beadsDir string, report *ArtifactReport) {
 			Description: fmt.Sprintf("redirect target is not a directory: %s", target),
 			SafeDelete:  false,
 		})
+		return
 	}
+
+	// gastownhall/beads#4692: FollowRedirect ignores a redirect whose target
+	// has no metadata.json and no recognizable database (a stray
+	// worktree-depth redirect, e.g. a relic of the "bd worktree create"
+	// write-site removed in #3051, can point past the real .beads dir into
+	// an empty location). Flag that here too as an actionable warning, not
+	// SafeDelete cruft -- the fix is to correct or remove the redirect file,
+	// not to delete anything automatically.
+	if !hasDatabaseOrMetadata(resolvedTarget) {
+		report.RedirectIssues = append(report.RedirectIssues, ArtifactFinding{
+			Path:        redirectPath,
+			Type:        "redirect",
+			Description: fmt.Sprintf("redirect target has no database or metadata.json (ignored by bd): %s", target),
+			SafeDelete:  false,
+		})
+	}
+}
+
+// hasDatabaseOrMetadata reports whether dir contains a metadata.json or a
+// recognizable Dolt/SQLite database. Mirrors the target-validity check
+// FollowRedirect (internal/beads) applies before honoring a redirect;
+// duplicated locally (rather than importing internal/beads) to keep this
+// package's existing pattern of small, self-contained filesystem checks
+// (see isRedirectExpectedDir/hasRedirectFile above).
+func hasDatabaseOrMetadata(dir string) bool {
+	if _, err := os.Stat(filepath.Join(dir, "metadata.json")); err == nil {
+		return true
+	}
+	if info, err := os.Stat(filepath.Join(dir, "dolt")); err == nil && info.IsDir() {
+		return true
+	}
+	if info, err := os.Stat(filepath.Join(dir, "embeddeddolt")); err == nil && info.IsDir() {
+		return true
+	}
+	dbMatches, _ := filepath.Glob(filepath.Join(dir, "*.db"))
+	for _, match := range dbMatches {
+		baseName := filepath.Base(match)
+		if !strings.Contains(baseName, ".backup") && baseName != "vc.db" {
+			return true
+		}
+	}
+	return false
 }

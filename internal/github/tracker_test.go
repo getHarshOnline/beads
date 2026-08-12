@@ -1,10 +1,14 @@
 package github
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -26,6 +30,39 @@ func TestRegistered(t *testing.T) {
 	}
 }
 
+func TestPushTargetScope(t *testing.T) {
+	tr := &Tracker{client: &Client{
+		BaseURL: "HTTPS://GHE.Example.Test/Api/v3///",
+		Owner:   "Acme",
+		Repo:    "Widgets",
+	}}
+	if got, want := tr.PushTargetScope(), "https://ghe.example.test/Api/v3/repos/acme/widgets"; got != want {
+		t.Fatalf("PushTargetScope() = %q, want %q", got, want)
+	}
+
+	equivalent := &Tracker{client: &Client{
+		BaseURL: "https://ghe.example.test/Api/v3",
+		Owner:   "acme",
+		Repo:    "widgets",
+	}}
+	if got, want := equivalent.PushTargetScope(), tr.PushTargetScope(); got != want {
+		t.Fatalf("equivalent PushTargetScope() = %q, want %q", got, want)
+	}
+
+	malformed := &Tracker{client: &Client{
+		BaseURL: "://GHE.Example.Test/Api/ ",
+		Owner:   "ACME",
+		Repo:    "WIDGETS",
+	}}
+	if got, want := malformed.PushTargetScope(), "://GHE.Example.Test/Api/repos/acme/widgets"; got != want {
+		t.Fatalf("malformed PushTargetScope() = %q, want deterministic fallback %q", got, want)
+	}
+
+	if got := (&Tracker{}).PushTargetScope(); got != "" {
+		t.Fatalf("uninitialized PushTargetScope() = %q, want empty", got)
+	}
+}
+
 func TestIsExternalRef(t *testing.T) {
 	tr := &Tracker{}
 	tests := []struct {
@@ -37,6 +74,12 @@ func TestIsExternalRef(t *testing.T) {
 		{"https://gitlab.com/group/project/-/issues/42", false},
 		{"https://linear.app/team/issue/PROJ-123", false},
 		{"", false},
+		// Shorthand format produced by BuildExternalRef
+		{"github:681509", true},
+		{"github:1", true},
+		{"github:abc", false},
+		{"github:123/extra", false},
+		{"github:0", false},
 	}
 	for _, tt := range tests {
 		if got := tr.IsExternalRef(tt.ref); got != tt.want {
@@ -54,6 +97,10 @@ func TestExtractIdentifier(t *testing.T) {
 		{"https://github.com/org/repo/issues/42", "42"},
 		{"https://github.com/team/project/issues/123", "123"},
 		{"not-a-url", ""},
+		// Shorthand format
+		{"github:681509", "681509"},
+		{"github:1", "1"},
+		{"github:abc", ""},
 	}
 	for _, tt := range tests {
 		if got := tr.ExtractIdentifier(tt.ref); got != tt.want {
@@ -241,6 +288,81 @@ func TestFieldMapperIssueToBeads_NilRaw(t *testing.T) {
 	conv := m.IssueToBeads(ti)
 	if conv != nil {
 		t.Error("IssueToBeads with nil Raw should return nil")
+	}
+}
+
+// TestGetConfig_YamlOnlyKeyBypassesStore is a regression test for the bug where
+// `bd github sync` errored "GitHub token not configured" even though the token
+// was set in .beads/config.yaml. The github tracker's getConfig used to read
+// every key from the Dolt store, but github.token is a yaml-only secret key
+// (never written to the DB). The fix routes yaml-only keys through config.yaml
+// and env var, skipping the store entirely.
+//
+// We verify the store-bypass by passing a nil store: before the fix this would
+// panic on the store deref; after the fix it falls through to GITHUB_TOKEN.
+func TestGetConfig_YamlOnlyKeyBypassesStore(t *testing.T) {
+	ctx := context.Background()
+	tr := &Tracker{store: nil}
+
+	t.Run("falls back to env var", func(t *testing.T) {
+		t.Setenv("GITHUB_TOKEN", "env-token-value")
+		got := tr.getConfig(ctx, "github.token", "GITHUB_TOKEN")
+		if got != "env-token-value" {
+			t.Errorf("getConfig(github.token) = %q, want %q", got, "env-token-value")
+		}
+	})
+
+	t.Run("returns empty when no value is set", func(t *testing.T) {
+		t.Setenv("GITHUB_TOKEN", "")
+		got := tr.getConfig(ctx, "github.token", "GITHUB_TOKEN")
+		if got != "" {
+			t.Errorf("getConfig(github.token) = %q, want empty", got)
+		}
+	})
+}
+
+// TestGetConfig_YamlOnlyKeyReadsFromYaml is the positive case for the fix:
+// when github.token is present in .beads/config.yaml, getConfig must return
+// that value (and not depend on GITHUB_TOKEN being set). This is the primary
+// behavior the PR restores; the BypassesStore test only proves the env-var
+// fallback path. Together they cover both branches of the yaml-only handler.
+func TestGetConfig_YamlOnlyKeyReadsFromYaml(t *testing.T) {
+	const wantToken = "yaml-config-token-value"
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	yamlBody := "github.token: \"" + wantToken + "\"\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "config.yaml"), []byte(yamlBody), 0o600); err != nil {
+		t.Fatalf("write config.yaml: %v", err)
+	}
+
+	// Isolate from the developer's environment so we read only the temp yaml.
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_TEST_IGNORE_REPO_CONFIG", "1")
+	t.Setenv("HOME", filepath.Join(tmpDir, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmpDir, "xdg"))
+	t.Chdir(tmpDir)
+
+	config.ResetForTesting()
+	t.Cleanup(config.ResetForTesting)
+	if err := config.Initialize(); err != nil {
+		t.Fatalf("config.Initialize: %v", err)
+	}
+
+	// Sanity-check that the yaml actually loaded — otherwise a getConfig
+	// failure could be mistaken for a tracker bug.
+	if got := config.GetString("github.token"); got != wantToken {
+		t.Fatalf("config.GetString(github.token) = %q, want %q (yaml not loaded?)", got, wantToken)
+	}
+
+	tr := &Tracker{store: nil}
+	got := tr.getConfig(context.Background(), "github.token", "GITHUB_TOKEN")
+	if got != wantToken {
+		t.Errorf("getConfig(github.token) = %q, want %q (yaml value)", got, wantToken)
 	}
 }
 

@@ -16,9 +16,6 @@ import (
 )
 
 func TestInitCancel_E2E(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow E2E test in short mode")
-	}
 	if runtime.GOOS == "windows" {
 		t.Skip("skipping SIGINT E2E test on Windows")
 	}
@@ -43,10 +40,12 @@ func TestInitCancel_E2E(t *testing.T) {
 	cmd.Stdin = stdinR
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stdoutW
-	cmd.Env = append(filteredEnv("BEADS_DB", "BEADS_DIR", "HOME", "XDG_CONFIG_HOME"),
+	cmd.Env = append(filteredEnv("BEADS_DB", "BEADS_DIR", "HOME", "XDG_CONFIG_HOME", "BD_NON_INTERACTIVE", "CI"),
 		"BEADS_DB=",
 		"HOME="+tmpDir,
 		"XDG_CONFIG_HOME="+filepath.Join(tmpDir, "xdg-config"),
+		"BD_NON_INTERACTIVE=0",
+		"CI=",
 	)
 
 	if err := cmd.Start(); err != nil {
@@ -107,7 +106,11 @@ func TestInitCancel_E2E(t *testing.T) {
 		}
 	case err := <-waitCh:
 		t.Fatalf("bd init exited before prompt: %v\nOutput: %s", err, getOutput())
-	case <-time.After(5 * time.Second):
+	// This deadline guards against a hung init, not startup speed: before the
+	// wizard prints anything, bd init creates the embedded dolt store, which
+	// under the nightly full-suite -race load takes ~5s on CI runners and grew
+	// past the old 5s limit (4.71s -> 4.92s -> 5.02s across 2026-07-23..25).
+	case <-time.After(60 * time.Second):
 		_ = cmd.Process.Kill()
 		err := <-waitCh
 		t.Fatalf("timeout waiting for prompt (exit=%v)\nOutput: %s", err, getOutput())
@@ -134,6 +137,16 @@ func TestInitCancel_E2E(t *testing.T) {
 	}
 	if !strings.Contains(getOutput(), "Setup canceled.") {
 		t.Fatalf("expected cancel message, got:\n%s", getOutput())
+	}
+}
+
+func runGitCmd(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed in %s: %v\n%s", args, dir, err, output)
 	}
 }
 

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/hooks"
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 // CommandContext holds all runtime state for command execution.
@@ -29,8 +29,11 @@ type CommandContext struct {
 	Verbose      bool
 	Quiet        bool
 
+	ServerMode        bool
+	ProxiedServerMode bool
+
 	// Runtime state
-	Store      *dolt.DoltStore
+	Store      storage.DoltStorage
 	RootCtx    context.Context
 	RootCancel context.CancelFunc
 	HookRunner *hooks.Runner
@@ -91,7 +94,7 @@ func shouldUseGlobals() bool {
 
 // getStore returns the current storage backend.
 // This is the primary way commands should access storage.
-func getStore() *dolt.DoltStore {
+func getStore() storage.DoltStorage {
 	if shouldUseGlobals() {
 		return store // fallback to legacy global during transition
 	}
@@ -99,7 +102,7 @@ func getStore() *dolt.DoltStore {
 }
 
 // setStore updates the storage backend in the CommandContext.
-func setStore(s *dolt.DoltStore) {
+func setStore(s storage.DoltStorage) {
 	if cmdCtx != nil {
 		cmdCtx.Store = s
 	}
@@ -359,6 +362,10 @@ func syncCommandContext() {
 	cmdCtx.LockTimeout = lockTimeout
 	cmdCtx.Verbose = verboseFlag
 	cmdCtx.Quiet = quietFlag
+
+	// Storage mode
+	cmdCtx.ServerMode = serverMode
+	cmdCtx.ProxiedServerMode = proxiedServerMode
 
 	// Runtime state
 	cmdCtx.Store = store

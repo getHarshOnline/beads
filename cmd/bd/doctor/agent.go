@@ -113,15 +113,13 @@ var agentEnrichers = map[string]enricher{
 	"Dolt Schema":                  enrichDoltSchema,
 	"Dolt Issue Count":             enrichDoltIssueCount,
 	"Dolt Status":                  enrichDoltStatus,
-	"Dolt Locks":                   enrichDoltLocks,
-	"Dolt Lock Health":             enrichLockHealth,
 	"Dependency Cycles":            enrichDependencyCycles,
 	"Duplicate Issues":             enrichDuplicateIssues,
 	"Test Pollution":               enrichTestPollution,
 	"Orphaned Dependencies":        enrichOrphanedDeps,
+	"Clone-Local FKs":              enrichCloneLocalFKs,
 	"Child-Parent Dependencies":    enrichChildParentDeps,
 	"Classic Artifacts":            enrichClassicArtifacts,
-	"Embedded Mode Concurrency":    enrichEmbeddedConcurrency,
 	"Pending Migrations":           enrichPendingMigrations,
 	"KV Sync Status":               enrichKVSync,
 	"Stale Closed Issues":          enrichStaleClosedIssues,
@@ -130,6 +128,9 @@ var agentEnrichers = map[string]enricher{
 	"Claude Settings Health":       enrichClaudeSettings,
 	"Claude Hook Completeness":     enrichClaudeHooks,
 	"Claude Plugin":                enrichClaudePlugin,
+	"Cursor Integration":           enrichCursor,
+	"Cursor Settings Health":       enrichCursorSettings,
+	"Cursor Hook Completeness":     enrichCursorHooks,
 	"bd prime Output":              enrichBdPrimeOutput,
 	"CLI Availability":             enrichBdInPath,
 	"Repo Fingerprint":             enrichRepoFingerprint,
@@ -237,7 +238,7 @@ func enrichCLIVersion(dc DoctorCheck) agentEnrichment {
 		explanation: fmt.Sprintf("CLI version check: %s. An outdated CLI may lack bug fixes or schema migrations needed by the current database.", dc.Message),
 		observed:    dc.Message,
 		expected:    "CLI version matches latest GitHub release",
-		commands:    []string{"go install github.com/steveyegge/beads/cmd/bd@latest"},
+		commands:    []string{installScriptCommand},
 		sourceFiles: []string{"cmd/bd/doctor/version.go:CheckCLIVersion"},
 	}
 }
@@ -245,7 +246,7 @@ func enrichCLIVersion(dc DoctorCheck) agentEnrichment {
 func enrichGitHooks(dc DoctorCheck) agentEnrichment {
 	return agentEnrichment{
 		severity:    "degraded",
-		explanation: fmt.Sprintf("Git hooks issue: %s. Beads git hooks auto-sync the database on commit/merge/push. Without them, changes won't propagate to other clones.", dc.Message),
+		explanation: fmt.Sprintf("Git hooks issue: %s. Beads git hooks refresh JSONL exports and run legacy fallback checks, while cross-clone sync uses Dolt remotes via bd dolt push/pull.", dc.Message),
 		observed:    dc.Message + "\n" + dc.Detail,
 		expected:    "Git hooks installed and version matches CLI version",
 		commands:    []string{"bd hooks install"},
@@ -258,7 +259,7 @@ func enrichGitHooksDolt(dc DoctorCheck) agentEnrichment {
 		severity:    "blocking",
 		explanation: fmt.Sprintf("Git hooks are incompatible with Dolt backend: %s. Hooks that predate the Dolt migration may run SQLite operations on a Dolt database, causing errors on every git operation.", dc.Message),
 		observed:    dc.Message + "\n" + dc.Detail,
-		expected:    "Git hooks contain Dolt-compatible sync commands",
+		expected:    "Git hooks contain Dolt-compatible commands",
 		commands:    []string{"bd hooks install"},
 		sourceFiles: []string{"cmd/bd/doctor/git.go:CheckGitHooksDoltCompatibility"},
 	}
@@ -309,13 +310,13 @@ func enrichGitUpstream(dc DoctorCheck) agentEnrichment {
 }
 
 func enrichFreshClone(dc DoctorCheck) agentEnrichment {
-	commands := []string{"bd init"}
-	explanation := fmt.Sprintf("Fresh clone detected: %s. The .beads/ directory exists (committed to git) but the local database hasn't been initialized. Run bd init to bootstrap from the tracked config.", dc.Message)
+	commands := []string{"bd bootstrap"}
+	explanation := fmt.Sprintf("Fresh clone detected: %s. The .beads/ directory exists (committed to git) but the local database has not been recovered yet. Run bd bootstrap as the safe existing-project recovery entry point.", dc.Message)
 
-	// When the message mentions sync.git-remote, include it in the suggested commands.
-	if strings.Contains(dc.Message, "sync.git-remote") {
-		explanation = fmt.Sprintf("Fresh clone detected: %s. The .beads/ directory exists (committed to git) but the database is not found on the configured server. Consider setting sync.git-remote in .beads/config.yaml to bootstrap from a Dolt remote, then run bd init.", dc.Message)
-		commands = []string{"Set sync.git-remote in .beads/config.yaml", "bd init"}
+	// When the message mentions sync.remote, include it in the suggested commands.
+	if strings.Contains(dc.Message, "sync.remote") {
+		explanation = fmt.Sprintf("Fresh clone detected: %s. The .beads/ directory exists (committed to git) but the database is not found on the configured server. Run bd bootstrap as the safe entry point; if bootstrap cannot find the expected remote automatically, then set sync.remote in .beads/config.yaml and rerun bd bootstrap.", dc.Message)
+		commands = []string{"bd bootstrap", "Set sync.remote in .beads/config.yaml if bootstrap cannot find the expected remote"}
 	}
 
 	return agentEnrichment{
@@ -415,28 +416,6 @@ func enrichDoltStatus(dc DoctorCheck) agentEnrichment {
 	}
 }
 
-func enrichDoltLocks(dc DoctorCheck) agentEnrichment {
-	return agentEnrichment{
-		severity:    "degraded",
-		explanation: fmt.Sprintf("Dolt lock issue: %s. Noms LOCK files prevent concurrent database access. If no bd process is running, these are stale and safe to remove.", dc.Message),
-		observed:    dc.Message + "\n" + dc.Detail,
-		expected:    "No stale noms LOCK files in .beads/dolt/",
-		commands:    []string{"bd doctor --fix", "find .beads/dolt -name LOCK -delete"},
-		sourceFiles: []string{"cmd/bd/doctor/migration_validation.go:CheckDoltLocks"},
-	}
-}
-
-func enrichLockHealth(dc DoctorCheck) agentEnrichment {
-	return agentEnrichment{
-		severity:    "degraded",
-		explanation: fmt.Sprintf("Lock health issue: %s. Database lock files may be held by another process or left from a crash. Check if another bd/dolt process is running before removing.", dc.Message),
-		observed:    dc.Message + "\n" + dc.Detail,
-		expected:    "No active or stale lock files",
-		commands:    []string{"lsof +D .beads/dolt 2>/dev/null | grep LOCK", "bd doctor --fix"},
-		sourceFiles: []string{"cmd/bd/doctor/dolt.go:CheckLockHealth"},
-	}
-}
-
 func enrichDependencyCycles(dc DoctorCheck) agentEnrichment {
 	return agentEnrichment{
 		severity:    "degraded",
@@ -481,6 +460,17 @@ func enrichOrphanedDeps(dc DoctorCheck) agentEnrichment {
 	}
 }
 
+func enrichCloneLocalFKs(dc DoctorCheck) agentEnrichment {
+	return agentEnrichment{
+		severity:    "advisory",
+		explanation: fmt.Sprintf("Severed clone-local FK(s): %s. A hard reset (flatten/compact squash, merge abort, migration error recovery) silently drops foreign keys from dolt_ignored tables onto the tracked plane; enforcement stays off across server restarts and orphaned rows accumulate until the constraint is re-added.", dc.Message),
+		observed:    dc.Message + "\n" + dc.Detail,
+		expected:    "Every FK on clone-local tables (events, wisp_dependencies, wisp_labels, wisp_comments, wisp_events, wisp_child_counters) present and enforcing",
+		commands:    []string{"bd doctor --fix"},
+		sourceFiles: []string{"cmd/bd/doctor/clone_local_fks.go:CheckCloneLocalFKs"},
+	}
+}
+
 func enrichChildParentDeps(dc DoctorCheck) agentEnrichment {
 	return agentEnrichment{
 		severity:    "advisory",
@@ -500,17 +490,6 @@ func enrichClassicArtifacts(dc DoctorCheck) agentEnrichment {
 		expected:    "No classic artifacts present (JSONL files, SQLite database, cruft directories)",
 		commands:    []string{"bd doctor --check=artifacts", "bd doctor --check=artifacts --clean"},
 		sourceFiles: []string{"cmd/bd/doctor/artifacts.go:CheckClassicArtifacts"},
-	}
-}
-
-func enrichEmbeddedConcurrency(dc DoctorCheck) agentEnrichment {
-	return agentEnrichment{
-		severity:    "advisory",
-		explanation: fmt.Sprintf("Embedded Dolt concurrency concern: %s. Multiple bd processes accessing the same embedded Dolt database can cause lock contention. Consider switching to Dolt server mode for concurrent access.", dc.Message),
-		observed:    dc.Message + "\n" + dc.Detail,
-		expected:    "Either single-process access or Dolt server mode configured",
-		commands:    []string{"gt dolt start", "bd config set dolt.server-mode true"},
-		sourceFiles: []string{"cmd/bd/doctor/broken_migration.go:CheckEmbeddedModeConcurrency"},
 	}
 }
 
@@ -561,7 +540,7 @@ func enrichStaleMolecules(dc DoctorCheck) agentEnrichment {
 func enrichClaude(dc DoctorCheck) agentEnrichment {
 	return agentEnrichment{
 		severity:    "advisory",
-		explanation: fmt.Sprintf("Claude integration: %s. Beads integrates with Claude Code via hooks (SessionStart, PreCompact) defined in .claude/settings.json.", dc.Message),
+		explanation: fmt.Sprintf("Claude integration: %s. Beads integrates with Claude Code via SessionStart hooks defined in .claude/settings.json.", dc.Message),
 		observed:    dc.Message + "\n" + dc.Detail,
 		expected:    "Claude Code hooks configured for beads (bd prime on SessionStart)",
 		commands:    []string{"bd hooks install"},
@@ -583,9 +562,9 @@ func enrichClaudeSettings(dc DoctorCheck) agentEnrichment {
 func enrichClaudeHooks(dc DoctorCheck) agentEnrichment {
 	return agentEnrichment{
 		severity:    "advisory",
-		explanation: fmt.Sprintf("Claude hook completeness: %s. Beads needs both SessionStart and PreCompact hooks to function properly in Claude Code sessions.", dc.Message),
+		explanation: fmt.Sprintf("Claude hook completeness: %s. Beads needs a SessionStart hook to inject context in Claude Code sessions, including after compaction.", dc.Message),
 		observed:    dc.Message + "\n" + dc.Detail,
-		expected:    "Both SessionStart and PreCompact hooks configured for beads",
+		expected:    "SessionStart hook configured for beads",
 		commands:    []string{"bd hooks install"},
 		sourceFiles: []string{"cmd/bd/doctor/claude.go:CheckClaudeHookCompleteness"},
 	}
@@ -599,6 +578,39 @@ func enrichClaudePlugin(dc DoctorCheck) agentEnrichment {
 		expected:    "Claude plugin version matches CLI version",
 		commands:    []string{"bd hooks install"},
 		sourceFiles: []string{"cmd/bd/doctor/claude.go:CheckClaudePlugin"},
+	}
+}
+
+func enrichCursor(dc DoctorCheck) agentEnrichment {
+	return agentEnrichment{
+		severity:    "advisory",
+		explanation: fmt.Sprintf("Cursor integration: %s. Beads integrates with Cursor via agent hooks in .cursor/hooks.json (or ~/.cursor/hooks.json) that run 'bd cursor-hook' to inject bd prime on sessionStart and recover context after compaction.", dc.Message),
+		observed:    dc.Message + "\n" + dc.Detail,
+		expected:    "Cursor hooks configured for beads (bd cursor-hook on sessionStart/preCompact/postToolUse)",
+		commands:    []string{"bd setup cursor"},
+		sourceFiles: []string{"cmd/bd/doctor/cursor.go:CheckCursor"},
+	}
+}
+
+func enrichCursorSettings(dc DoctorCheck) agentEnrichment {
+	return agentEnrichment{
+		severity:    "blocking",
+		explanation: fmt.Sprintf("Cursor hooks file is malformed: %s. A corrupted .cursor/hooks.json prevents Cursor from loading any hooks, which silently breaks beads context injection and post-compaction recovery.", dc.Message),
+		observed:    dc.Message + "\n" + dc.Detail,
+		expected:    ".cursor/hooks.json (and ~/.cursor/hooks.json) are valid JSON",
+		commands:    []string{"cat .cursor/hooks.json | python3 -m json.tool", "bd setup cursor"},
+		sourceFiles: []string{"cmd/bd/doctor/cursor.go:CheckCursorSettingsHealth"},
+	}
+}
+
+func enrichCursorHooks(dc DoctorCheck) agentEnrichment {
+	return agentEnrichment{
+		severity:    "advisory",
+		explanation: fmt.Sprintf("Cursor hook completeness: %s. Beads recovers context across compaction in Cursor using three hooks: sessionStart, preCompact, and postToolUse. A partial install degrades recovery.", dc.Message),
+		observed:    dc.Message + "\n" + dc.Detail,
+		expected:    "sessionStart, preCompact, and postToolUse hooks all configured for beads",
+		commands:    []string{"bd setup cursor"},
+		sourceFiles: []string{"cmd/bd/doctor/cursor.go:CheckCursorHookCompleteness"},
 	}
 }
 
@@ -618,7 +630,7 @@ func enrichBdInPath(dc DoctorCheck) agentEnrichment {
 		explanation: fmt.Sprintf("bd not in PATH: %s. Claude Code hooks invoke bd commands, but bd is not found in the system PATH. Hooks will fail silently.", dc.Message),
 		observed:    dc.Message,
 		expected:    "'bd' executable is in PATH and runnable",
-		commands:    []string{"which bd", "go install github.com/steveyegge/beads/cmd/bd@latest"},
+		commands:    []string{"which bd", installScriptCommand},
 		sourceFiles: []string{"cmd/bd/doctor/claude.go:CheckBdInPath"},
 	}
 }

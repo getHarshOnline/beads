@@ -6,7 +6,9 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/workapi"
 )
 
 var infoCmd = &cobra.Command{
@@ -28,146 +30,155 @@ Examples:
   bd info --whats-new
   bd info --whats-new --json
   bd info --thanks`,
-	Run: func(cmd *cobra.Command, args []string) {
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("info")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		schemaFlag, _ := cmd.Flags().GetBool("schema")
 		whatsNewFlag, _ := cmd.Flags().GetBool("whats-new")
 		thanksFlag, _ := cmd.Flags().GetBool("thanks")
 
-		// Handle --thanks flag
 		if thanksFlag {
 			printThanksPage()
-			return
+			return nil
 		}
 
-		// Handle --whats-new flag
 		if whatsNewFlag {
-			showWhatsNew()
-			return
+			return showWhatsNew()
 		}
 
-		// Get database path (absolute)
-		absDBPath, err := filepath.Abs(dbPath)
-		if err != nil {
-			absDBPath = dbPath
+		if usesProxiedServer() {
+			return runInfoProxiedServer(rootCtx, schemaFlag)
 		}
 
-		// Build info structure
+		absDBPath := absoluteDBPath()
+
 		info := map[string]interface{}{
 			"database_path": absDBPath,
 			"mode":          "direct",
 		}
 
-		// Get issue count from direct store
 		if store != nil {
 			ctx := rootCtx
 
-			filter := types.IssueFilter{}
-			issues, err := store.SearchIssues(ctx, "", filter)
+			issues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
 			if err == nil {
 				info["issue_count"] = len(issues)
 			}
-		}
 
-		// Add config to info output
-		if store != nil {
-			ctx := rootCtx
+			// THE SAME FILTER THE SETTINGS ROLE USES. `bd info --json` serves
+			// this map whole, and the beads MCP server's get_schema_info tool
+			// runs `bd info --schema --json` and returns the parsed dict —
+			// config included — so every memory key AND VALUE landed in the
+			// transcript of any agent that asked a SCHEMA question. `bd info`
+			// is also the diagnostic people paste into bug reports.
+			//
+			// Unlike `bd config show`, which an operator asks for by name to
+			// see provenance, nothing here says "show me my memories".
 			configMap, err := store.GetAllConfig(ctx)
-			if err == nil && len(configMap) > 0 {
-				info["config"] = configMap
-			}
-		}
-
-		// Add schema information if requested
-		if schemaFlag && store != nil {
-			ctx := rootCtx
-
-			// Get schema version
-			schemaVersion, err := store.GetMetadata(ctx, "bd_version")
-			if err != nil {
-				schemaVersion = "unknown"
-			}
-
-			// Get tables
-			tables := []string{"issues", "dependencies", "labels", "config", "metadata"}
-
-			// Get config
-			configMap := make(map[string]string)
-			prefix, _ := store.GetConfig(ctx, "issue_prefix") // Best effort: empty prefix is valid
-			if prefix != "" {
-				configMap["issue_prefix"] = prefix
-			}
-
-			// Get sample issue IDs
-			filter := types.IssueFilter{}
-			issues, err := store.SearchIssues(ctx, "", filter)
-			sampleIDs := []string{}
-			detectedPrefix := ""
-			if err == nil && len(issues) > 0 {
-				// Get first 3 issue IDs as samples
-				maxSamples := 3
-				if len(issues) < maxSamples {
-					maxSamples = len(issues)
-				}
-				for i := 0; i < maxSamples; i++ {
-					sampleIDs = append(sampleIDs, issues[i].ID)
-				}
-				// Detect prefix from first issue
-				if len(issues) > 0 {
-					detectedPrefix = extractPrefix(issues[0].ID)
+			if err == nil {
+				if filtered := workapi.FilterSettingsEnumeration(configMap); len(filtered) > 0 {
+					info["config"] = filtered
 				}
 			}
 
-			info["schema"] = map[string]interface{}{
-				"tables":           tables,
-				"schema_version":   schemaVersion,
-				"config":           configMap,
-				"sample_issue_ids": sampleIDs,
-				"detected_prefix":  detectedPrefix,
+			if schemaFlag {
+				schemaVersion, err := store.GetLocalMetadata(ctx, "bd_version")
+				if err != nil {
+					schemaVersion = "unknown"
+				}
+				prefix, _ := store.GetConfig(ctx, "issue_prefix") // Best effort: empty prefix is valid
+				info["schema"] = buildInfoSchema(schemaVersion, prefix, issues)
 			}
 		}
 
-		// JSON output
-		if jsonOutput {
-			outputJSON(info)
-			return
-		}
-
-		// Human-readable output
-		fmt.Println("\nBeads Database Information")
-		fmt.Println("===========================")
-		fmt.Printf("Database: %s\n", absDBPath)
-		fmt.Printf("Mode: direct\n")
-
-		// Show issue count
-		if count, ok := info["issue_count"].(int); ok {
-			fmt.Printf("\nIssue Count: %d\n", count)
-		}
-
-		// Show schema information if requested
-		if schemaFlag {
-			if schemaInfo, ok := info["schema"].(map[string]interface{}); ok {
-				fmt.Println("\nSchema Information:")
-				fmt.Printf("  Tables: %v\n", schemaInfo["tables"])
-				if version, ok := schemaInfo["schema_version"].(string); ok {
-					fmt.Printf("  Schema Version: %s\n", version)
-				}
-				if prefix, ok := schemaInfo["detected_prefix"].(string); ok && prefix != "" {
-					fmt.Printf("  Detected Prefix: %s\n", prefix)
-				}
-				if samples, ok := schemaInfo["sample_issue_ids"].([]string); ok && len(samples) > 0 {
-					fmt.Printf("  Sample Issues: %v\n", samples)
-				}
-			}
-		}
-
-		// Check git hooks status
-		hookStatuses := CheckGitHooks()
-		if warning := FormatHookWarnings(hookStatuses); warning != "" {
-			fmt.Printf("\n%s\n", warning)
-		}
-
-		fmt.Println()
+		return renderInfo(info, schemaFlag, absDBPath)
 	},
+}
+
+func absoluteDBPath() string {
+	absDBPath, err := filepath.Abs(dbPath)
+	if err != nil {
+		return dbPath
+	}
+	return absDBPath
+}
+
+func buildInfoSchema(schemaVersion, prefix string, issues []*types.Issue) map[string]interface{} {
+	tables := []string{"issues", "dependencies", "labels", "config", "metadata"}
+
+	configMap := make(map[string]string)
+	if prefix != "" {
+		configMap["issue_prefix"] = prefix
+	}
+
+	sampleIDs := []string{}
+	detectedPrefix := ""
+	if len(issues) > 0 {
+		maxSamples := 3
+		if len(issues) < maxSamples {
+			maxSamples = len(issues)
+		}
+		for i := 0; i < maxSamples; i++ {
+			sampleIDs = append(sampleIDs, issues[i].ID)
+		}
+		detectedPrefix = extractPrefix(issues[0].ID)
+	}
+
+	return map[string]interface{}{
+		"tables":           tables,
+		"schema_version":   schemaVersion,
+		"config":           configMap,
+		"sample_issue_ids": sampleIDs,
+		"detected_prefix":  detectedPrefix,
+	}
+}
+
+func renderInfo(info map[string]interface{}, schemaFlag bool, absDBPath string) error {
+	if jsonOutput {
+		return outputJSON(info)
+	}
+
+	mode, _ := info["mode"].(string)
+
+	fmt.Println("\nBeads Database Information")
+	fmt.Println("===========================")
+	fmt.Printf("Database: %s\n", absDBPath)
+	fmt.Printf("Mode: %s\n", mode)
+
+	if count, ok := info["issue_count"].(int); ok {
+		fmt.Printf("\nIssue Count: %d\n", count)
+	}
+
+	if schemaFlag {
+		if schemaInfo, ok := info["schema"].(map[string]interface{}); ok {
+			fmt.Println("\nSchema Information:")
+			fmt.Printf("  Tables: %v\n", schemaInfo["tables"])
+			if version, ok := schemaInfo["schema_version"].(string); ok {
+				fmt.Printf("  Schema Version: %s\n", version)
+			}
+			if prefix, ok := schemaInfo["detected_prefix"].(string); ok && prefix != "" {
+				fmt.Printf("  Detected Prefix: %s\n", prefix)
+			}
+			if samples, ok := schemaInfo["sample_issue_ids"].([]string); ok && len(samples) > 0 {
+				fmt.Printf("  Sample Issues: %v\n", samples)
+			}
+		}
+	}
+
+	hookStatuses := CheckGitHooks()
+	if warning := FormatHookWarnings(hookStatuses); warning != "" {
+		fmt.Printf("\n%s\n", warning)
+	}
+
+	fmt.Println()
+	return nil
 }
 
 // extractPrefix extracts the prefix from an issue ID (e.g., "bd-123" -> "bd")
@@ -210,6 +221,196 @@ type VersionChange struct {
 // versionChanges contains agent-actionable changes for recent versions
 var versionChanges = []VersionChange{
 	{
+		Version: "1.2.1",
+		Date:    "2026-08-11",
+		Changes: []string{
+			"MIGRATION: first open with this binary runs migration 0062 (events -> dolt_ignored storage, bd-red8u): a one-time four-phase self-committing flip that removes per-event dolt commit churn. Expect one slower first invocation per clone; do not interrupt it.",
+			"NEW: `bd sync` — the federation loop (export, commit, pull, import, push) as one verb.",
+			"NEW: `--brief` on `bd list` / `bd ready --json` and the HTTP listings — omits free-form text fields (~93% smaller payloads on large stores); fields are omitted without a marker, so only the caller that passed the flag knows rows are partial.",
+			"BEHAVIOR: expired dated defers now AUTO-WAKE on ready-front reads and claims (#5386) — a lapsed `--defer` no longer hides an issue forever; stale defers surface on the next `bd ready`.",
+			"PERF: telemetry no longer costs startup time on every invocation (#5646), and the queued-events dir is bounded (7d TTL + drop-oldest caps, #5660) — a backlogged ~/.beads/eventsData self-prunes.",
+		},
+	},
+	{
+		Version: "1.1.2",
+		Date:    "2026-07-26",
+		Changes: []string{
+			"FIX: the v53 aux row re-key no longer aborts the migration on dolt#11131 encoding drift ('invalid hash length' panic); drifted tables are skipped with a warning, recorded clone-locally, and retried on later passes instead of leaving the database unopenable (#4380).",
+		},
+	},
+	{
+		Version: "1.1.0",
+		Date:    "2026-07-04",
+		Changes: []string{
+			"STABLE: first stable 1.1.x release; includes the rc.1 and rc.2 cross-clone migration-safety work plus post-rc.2 recovery fixes.",
+			"UPGRADE: back up with bd export --all before migrating older or remote-backed databases; the upgrade docs now carry the stable 1.1.0 recipes.",
+			"FIX: failed v53 migrations can self-heal on the next open, including wisp_dependencies split-column drift and dirty snapshot tables left by a half-applied pass (#4555, #4558).",
+			"FIX: bd dolt commit and bd vc commit can commit a dirty embedded working set that is blocking a pending schema migration; after that, bd migrate can proceed (#4566, #4567).",
+			"NEW: the state-aware remote-migrate gate is enabled by default; safe first-mover migrations proceed, while remote-ahead or content-skew cases still stop for adoption or human review (#4516).",
+		},
+	},
+	{
+		Version: "1.1.0-rc.2",
+		Date:    "2026-07-02",
+		Changes: []string{
+			"RC: fixes the two upgrade-breaking migration regressions reported against rc.1 (#4502, #4534); back up with bd export --all before migrating a remote-backed database.",
+			"FIX: the v53 migration no longer fails with Unknown column on databases whose issues table predates the rig/agent columns; the runner repairs the drift before applying (#4502).",
+			"FIX: an orphaned child_counters row no longer bricks every bd create after the fk_counter_parent constraint returned; a clone-local cleanup migration heals affected databases automatically (#4534).",
+			"FIX: old binaries fail fast on writable opens of a schema-newer database instead of proceeding blind (#4531).",
+			"NEW: the remote-migrate gate is state-aware and agent-safe — provably safe migrations auto-resolve; risky states still require BD_ALLOW_REMOTE_MIGRATE=1 by the designated migrator (#4515, #4516).",
+			"UPGRADE: the upgrade guide now carries a validated remote-backed / multi-clone recipe with a pre-migrate backup step (#4514).",
+		},
+	},
+	{
+		Version: "1.1.0-rc.1",
+		Date:    "2026-06-23",
+		Changes: []string{
+			"RC: v1.0.5 was pulled from the default release path after #4259; this candidate carries the cross-clone data-safety fixes for validation before stable promotion.",
+			"UPGRADE: For multiple clones sharing one Dolt remote, sync every clone before upgrading, designate one machine to migrate and push, then upgrade/pull the remaining clones before doing tracked work.",
+			"NEW: bd refuses silent in-place schema migrations on existing remote-backed databases unless BD_ALLOW_REMOTE_MIGRATE=1 is set by the designated migrator.",
+			"NEW: schema_migrations records per-migration content hashes, and bd doctor reports migration-content skew against the cached remote-tracking ref.",
+			"FIX: dependencies and wisp_dependencies now use deterministic natural-key-derived IDs, with migration 0050 rekeying existing rows and same-edge pull conflicts auto-resolved when only audit columns differ.",
+			"FIX: Dolt primary-key merge refusals are classified with recovery guidance instead of surfacing only a raw Error 1105.",
+		},
+	},
+	{
+		Version: "1.0.5",
+		Date:    "2026-05-28",
+		Changes: []string{
+			"CHANGE: dependencies.depends_on_id is now a STORED generated column — writes must target exactly one of depends_on_issue_id/depends_on_wisp_id/depends_on_external (enforced by ck_dep_one_target); inserting into depends_on_id fails. Migrations 0041–0042 are intentionally irreversible (restore from a prior Dolt commit to roll back).",
+			"CHANGE: JSONL auto-export and auto-staging are now opt-in — set export.auto=true and export.git-add=true to keep the old behavior. Dolt is the canonical store; use bd dolt push/pull for sync and bd backup for restorable backups.",
+			"CHANGE: Foreign keys with ON DELETE/UPDATE CASCADE now span issue and wisp tables, so parent delete/rename cascades automatically.",
+			"NEW: dolt.mode config key (server|embedded) with validation; bd init warns on ambiguous configs and hard-fails when dolt.host/dolt.port are set without server mode.",
+			"NEW: forward schema-skew guard hard-fails when a binary opens a database migrated to a newer schema than it understands.",
+			"NEW: bd list --skip-labels toggle; bd show --json count-only details with opt-in streamed payloads.",
+			"FIX: bd close supports per-id reasons and idempotent re-close; bd create --defer <future> creates a deferred issue; bd create commits labels atomically.",
+			"FIX: migrations run on a connection with no read timeout; duplicate migration version numbers hard-fail instead of silently under-applying.",
+		},
+	},
+	{
+		Version: "1.0.4",
+		Date:    "2026-05-07",
+		Changes: []string{
+			"NEW: bd init-safety plus --reinit-local/--discard-remote make remote-history destructive init paths explicit, with stable refusal exit codes 10/11/12",
+			"CHANGE: bd init --force is now local-only and deprecated in favor of --reinit-local; use --discard-remote only when intentionally replacing remote Dolt history",
+			"CHANGE: beads.OpenBestAvailable now returns (Storage, error); SDK callers must drop the removed Unlocker return value",
+			"FIX: bd close now uses routed ID resolution in contributor auto-routing workspaces, matching show/update behavior",
+			"FIX: Dolt-in-git internal refs/dolt/data pushes skip git hooks to avoid hook recursion",
+			"FIX: release workflow and packaging paths hardened for the v1.0.4 release attempt, including checked-in formula adoption and pure-Go test helper coverage",
+		},
+	},
+	{
+		Version: "1.0.3",
+		Date:    "2026-04-24",
+		Changes: []string{
+			"FIX: go install @latest — new release tag removes the go.mod replace directives that made v1.0.1 and v1.0.2 uninstallable via go install",
+			"FIX: npm macOS installs — release archives are flat so npm postinstall finds the bd binary at the archive root",
+			"FIX: Windows install — make install removes stale extensionless bd before installing bd.exe so old binaries do not shadow the new executable",
+			"FIX: Windows test portability and embedded pre-commit export cwd handling",
+		},
+	},
+	{
+		Version: "1.0.2",
+		Date:    "2026-04-15",
+		Changes: []string{
+			"FIX: npm publish — updated npm-package/package.json URLs (repository, bugs, homepage) from steveyegge/beads to gastownhall/beads so sigstore provenance validation accepts the artifact (v1.0.0 and v1.0.1 npm publishes failed E422 on provenance verification)",
+		},
+	},
+	{
+		Version: "1.0.1",
+		Date:    "2026-04-15",
+		Changes: []string{
+			"NEW: bd batch — atomic multi-operation transactions across create/update/close/dep",
+			"NEW: bd config drift / bd config apply — detect and reconcile config drift across yaml, git, and database",
+			"NEW: bd config show — unified provenance view for effective config values",
+			"NEW: started_at timestamp on issues (recorded when first entering in_progress)",
+			"NEW: Selective sync — --issues flag, push/pull subcommands, --parent port across trackers",
+			"NEW: Pool metrics telemetry for shared-server connection pool diagnosis",
+			"NEW: OpenBestAvailable public API for library consumers",
+			"NEW: az:// (Azure Blob Storage) recognized as Dolt remote URL scheme",
+			"NEW: BEADS_DOLT_READY_TIMEOUT env var to override 10s waitForReady timeout on slow hardware",
+			"CHANGE: Auto-export enabled by default — export.path defaults to issues.jsonl, git-add on",
+			"CHANGE: gms_pure_go by default — ICU linkage dropped from test/install helpers and release binaries",
+			"FIX: Worktree-aware path resolution across hooks, doctor, config validate, bootstrap, reset, rename-prefix, formula search",
+			"FIX: Schema migration conflict and wisp-tables-missing-after-bootstrap-clone",
+			"FIX: bd mol bond now detects transitive dependency cycles",
+			"FIX: bd dep add/remove allows cross-prefix dependency targets",
+			"FIX: bd dolt pull nil-pointer panic in embedded mode",
+			"FIX: bd list truncation hint shown in all output modes; --watch hierarchy ordering stable",
+			"FIX: bd update --defer correctly sets status=deferred",
+			"FIX: Remote URL validation hardened at config parse time (security)",
+			"FIX: GitLab issue link dependencies now imported during sync pull",
+			"FIX: SQLite-era JSONL migration preserves dependencies and labels",
+			"FIX: MCP workspace discovery detects Dolt-backed projects",
+			"FIX: go install on Windows (ICU header dependency removed)",
+		},
+	},
+	{
+		Version: "0.63.3",
+		Date:    "2026-03-29",
+		Changes: []string{
+			"NEW: Embedded Dolt is now the default storage backend — no separate server needed",
+			"NEW: bd create --graph for batch issue creation from dependency graphs",
+			"NEW: Multi-project/team sync for Linear, Jira, and ADO",
+			"NEW: Notion sync reimplemented on REST data sources",
+			"NEW: GitLab group-level issue sync",
+			"NEW: Top-level command aliases (comment, assign, tag, link, priority)",
+			"NEW: Storage API expansion — ListWisps, MergeSlot, ReopenIssue, and more",
+			"CHANGE: Backup system simplified — git-based backup removed, Dolt-native only",
+			"CHANGE: Dolt writeRetryTx auto-retries on serialization errors",
+			"FIX: Init git cache reset prevents stale embedded refs",
+			"FIX: CWD .beads/ priority over git-worktree resolution",
+			"FIX: Epic closure correctly includes wisp children",
+			"FIX: Prefix routing for edit, reopen, and delete commands",
+			"FIX: ADO/Jira custom type_map no longer silently ignored",
+		},
+	},
+	{
+		Version: "0.62.0",
+		Date:    "2026-03-21",
+		Changes: []string{
+			"NEW: Custom status categories (active/wip/done/frozen) control bd ready and bd list behavior",
+			"NEW: bd statuses command lists all statuses with icons and categories",
+			"NEW: bd note command for quick note appending",
+			"NEW: Audit logging of status changes to interactions.jsonl",
+			"NEW: --exclude-type flag for bd ready and bd list",
+			"NEW: Azure DevOps integration (bd ado sync/status/projects)",
+			"NEW: Memories included in export/import round-trip",
+			"CHANGE: BEADS_ACTOR replaces BD_ACTOR as primary env var",
+			"CHANGE: ServerMode enum consolidates Dolt server ownership inference",
+			"CHANGE: Internal GT-specific concepts removed — beads is now standalone",
+			"FIX: Windows Dolt lifecycle — stale state files, false stop warnings",
+			"FIX: Hook preservation — all hooks preserved on core.hooksPath override",
+			"FIX: Shim timeout 30s→300s — chained hooks no longer killed prematurely",
+			"FIX: GetNextChildIDTx broken SQL CAST for non-numeric IDs",
+			"FIX: Credential key added to project-root .gitignore",
+			"FIX: Concurrent initSchemaOnDB serialized with GET_LOCK",
+			"FIX: External Dolt servers no longer killed by KillStaleServers",
+		},
+	},
+	{
+		Version: "0.61.0",
+		Date:    "2026-03-15",
+		Changes: []string{
+			"NEW: --no-history flag separates Dolt commit skipping from GC eligibility",
+			"NEW: --claim-next on close auto-claims next ready issue",
+			"NEW: Auto-detect beads database on git origin during init/bootstrap",
+			"NEW: Install checksum verification (SHA256)",
+			"NEW: --exclude-type for wisp GC, --type filter for wisp list",
+			"NEW: Jira pull_jql config for custom JQL filters",
+			"CHANGE: Prime SSOT — versioned hash-based markers, profile support, staleness detection",
+			"CHANGE: Formula extends merges child steps by ID instead of appending",
+			"CHANGE: Circuit breaker keyed on host:port, not port only",
+			"CHANGE: Backup export/restore scoped by project prefix",
+			"FIX: Embedded Dolt CI — stale noms LOCK cleanup, test fixes",
+			"FIX: Port-0 circuit breaker poisoning prevention",
+			"FIX: KillStaleServers scoped to repo, port resolution chain fix",
+			"FIX: Doctor fingerprint, auto-start, runtime detection fixes",
+			"FIX: Credential key moved to .beads/ (no ghost directories)",
+			"FIX: UUID primary keys for federation-safe events/comments",
+		},
+	},
+	{
 		Version: "0.60.0",
 		Date:    "2026-03-12",
 		Changes: []string{
@@ -243,6 +444,29 @@ var versionChanges = []VersionChange{
 			"FIX: Worktree hooks use absolute core.hooksPath (GH#2414)",
 			"FIX: BEADS_DIR stabilized from detached worktrees",
 			"PERF: Close-time template subgraph loading speed improvement (GH#2458)",
+			"NEW: Config-driven metadata schema enforcement",
+			"NEW: --metadata for bd create, --set-metadata/--unset-metadata for bd update",
+			"NEW: PreToolUse hook blocks interactive cp/mv/rm prompts",
+			"NEW: Self-managing Dolt server (port collision, idle monitor, crash watchdog)",
+			"NEW: bd dolt remote add/list/remove commands",
+			"NEW: Auto-push to Dolt remote with 5-minute debounce",
+			"NEW: Per-worktree .beads/redirect override",
+			"NEW: Counter mode (issue_id_mode=counter) for sequential IDs",
+			"NEW: Auto-migrate SQLite to Dolt on first bd command",
+			"NEW: Label inheritance — children inherit parent labels",
+			"NEW: Jira V2 API support",
+			"NEW: Linear Project sync support",
+			"FIX: Shadow database prevention — no more silent CREATE DATABASE",
+			"FIX: Reparented child no longer appears under old parent",
+			"FIX: Dolt port resolution uses ephemeral port (not hardcoded 3307)",
+			"FIX: Doctor checks respect dolt-data-dir config",
+			"FIX: UUID primary keys replace AUTO_INCREMENT (federation-safe)",
+			"FIX: Windows compatibility (Makefile, connectex, doltserver)",
+			"FIX: Batch SQL IN-clause queries prevent query explosion",
+			"FIX: Conditional-blocks deps evaluated in readiness checks",
+			"FIX: Migration safety — verify DB target, deduplicate, spot-check data",
+			"PERF: Test parallelization — storage 3.5x, protocol 3x faster",
+			"PERF: Branch-per-test isolation — doctor tests 44s → 12s",
 		},
 	},
 	{
@@ -307,29 +531,6 @@ var versionChanges = []VersionChange{
 			"NEW: bd backup init/sync/restore for Dolt-native backups",
 			"NEW: bd gc, bd compact, bd flatten for standalone lifecycle",
 			"NEW: Circuit breaker for Dolt server connections",
-			"NEW: Config-driven metadata schema enforcement",
-			"NEW: --metadata for bd create, --set-metadata/--unset-metadata for bd update",
-			"NEW: PreToolUse hook blocks interactive cp/mv/rm prompts",
-			"NEW: Self-managing Dolt server (port collision, idle monitor, crash watchdog)",
-			"NEW: bd dolt remote add/list/remove commands",
-			"NEW: Auto-push to Dolt remote with 5-minute debounce",
-			"NEW: Per-worktree .beads/redirect override",
-			"NEW: Counter mode (issue_id_mode=counter) for sequential IDs",
-			"NEW: Auto-migrate SQLite to Dolt on first bd command",
-			"NEW: Label inheritance — children inherit parent labels",
-			"NEW: Jira V2 API support",
-			"NEW: Linear Project sync support",
-			"FIX: Shadow database prevention — no more silent CREATE DATABASE",
-			"FIX: Reparented child no longer appears under old parent",
-			"FIX: Dolt port resolution uses ephemeral port (not hardcoded 3307)",
-			"FIX: Doctor checks respect dolt-data-dir config",
-			"FIX: AUTO_INCREMENT reset after DOLT_PULL",
-			"FIX: Windows compatibility (Makefile, connectex, doltserver)",
-			"FIX: Batch SQL IN-clause queries prevent query explosion",
-			"FIX: Conditional-blocks deps evaluated in readiness checks",
-			"FIX: Migration safety — verify DB target, deduplicate, spot-check data",
-			"PERF: Test parallelization — storage 3.5x, protocol 3x faster",
-			"PERF: Branch-per-test isolation — doctor tests 44s → 12s",
 		},
 	},
 	{
@@ -580,7 +781,7 @@ var versionChanges = []VersionChange{
 			"FIX: Import custom issue types (#1322)",
 			"FIX: SQLite transaction improvements (#1272, #1276)",
 			"FIX: Multiple Dolt backend fixes for hooks, routing, and daemon compatibility",
-			"DOCS: Comprehensive docs/DOLT.md guide (#1310)",
+			"DOCS: Comprehensive Dolt backend guide, now at docs/architecture/dolt.md (#1310)",
 		},
 	},
 	{
@@ -712,7 +913,7 @@ var versionChanges = []VersionChange{
 			"NEW: Sync divergence detection - JSONL/SQLite/git consistency checks (GH#885)",
 			"NEW: PRIME.md override - Custom prime output per project (GH#876)",
 			"NEW: Compound visualization - bd mol show displays compound structure (bd-iw4z)",
-			"NEW: /handoff skill - Session cycling slash command (bd-xwvo)",
+			"NEW: /handoff skill - Session handoff slash command (bd-xwvo)",
 			"FIX: bd ready now shows in_progress issues (#894)",
 			"FIX: macOS case-insensitive path handling for worktrees/daemon (GH#880)",
 			"FIX: Sync metadata timing - finalize after commit not push (GH#885)",
@@ -769,7 +970,7 @@ var versionChanges = []VersionChange{
 			"NEW: bd human command - Focused help menu for humans",
 			"NEW: bd show --short - Compact output mode for scripting",
 			"NEW: bd delete --reason - Audit trail for deletions",
-			"NEW: 'hooked' status - Hook-based work assignment for orchestrators",
+			"NEW: 'hooked' status - Work actively claimed by a worker",
 			"NEW: mol_type schema field - Molecule classification tracking",
 			"FIX: --var flag allows commas in values (GH#786)",
 			"FIX: bd sync in bare repo worktrees (GH#785)",
@@ -1240,16 +1441,14 @@ var versionChanges = []VersionChange{
 	},
 }
 
-// showWhatsNew displays agent-relevant changes from recent versions
-func showWhatsNew() {
-	currentVersion := Version // from version.go
+func showWhatsNew() error {
+	currentVersion := Version
 
 	if jsonOutput {
-		outputJSON(map[string]interface{}{
+		return outputJSON(map[string]interface{}{
 			"current_version": currentVersion,
 			"recent_changes":  versionChanges,
 		})
-		return
 	}
 
 	// Human-readable output
@@ -1274,12 +1473,12 @@ func showWhatsNew() {
 
 	fmt.Println("💡 Tip: Use `bd info --whats-new --json` for machine-readable output")
 	fmt.Println()
+	return nil
 }
 
 func init() {
 	infoCmd.Flags().Bool("schema", false, "Include schema information in output")
 	infoCmd.Flags().Bool("whats-new", false, "Show agent-relevant changes from recent versions")
 	infoCmd.Flags().Bool("thanks", false, "Show thank you page for contributors")
-	infoCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 	rootCmd.AddCommand(infoCmd)
 }

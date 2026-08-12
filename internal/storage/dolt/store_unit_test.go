@@ -9,6 +9,8 @@ import (
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/schema"
 )
 
 // newTestDoltDB creates a temporary database on the test Dolt server.
@@ -24,7 +26,7 @@ func newTestDoltDB(t *testing.T) (*sql.DB, func()) {
 
 	dbName := uniqueTestDBName(t)
 
-	adminDSN := fmt.Sprintf("root@tcp(127.0.0.1:%d)/", testServerPort)
+	adminDSN := doltutil.ServerDSN{Host: "127.0.0.1", Port: testServerPort, User: "root"}.String()
 	admin, err := sql.Open("mysql", adminDSN)
 	if err != nil {
 		t.Fatalf("failed to connect to test Dolt server: %v", err)
@@ -35,7 +37,7 @@ func newTestDoltDB(t *testing.T) (*sql.DB, func()) {
 	}
 	admin.Close()
 
-	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%d)/%s", testServerPort, dbName)
+	dsn := doltutil.ServerDSN{Host: "127.0.0.1", Port: testServerPort, User: "root", Database: dbName}.String()
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		t.Fatalf("failed to connect to test database %s: %v", dbName, err)
@@ -45,6 +47,13 @@ func newTestDoltDB(t *testing.T) (*sql.DB, func()) {
 		db.Close()
 		// Skip DROP DATABASE — rapid CREATE/DROP cycles crash the Dolt container.
 		// Orphan databases are cleaned up when the container terminates.
+	}
+}
+
+func TestIsRetryableErrorSchemaMigrationLock(t *testing.T) {
+	err := fmt.Errorf("schema migration: %w", schema.ErrMigrationLockUnavailable)
+	if !isRetryableError(err) {
+		t.Fatal("schema migration lock errors should be retryable")
 	}
 }
 
@@ -217,6 +226,7 @@ func TestApplyConfigDefaults_TestModeUseSentinelPort(t *testing.T) {
 			os.Setenv("BEADS_DOLT_PORT", origPort)
 		}
 	}()
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "") // clear new primary port env so legacy path runs
 
 	os.Setenv("BEADS_TEST_MODE", "1")
 	os.Unsetenv("BEADS_DOLT_PORT")
@@ -242,6 +252,7 @@ func TestApplyConfigDefaults_TestModeWithPort(t *testing.T) {
 			os.Setenv("BEADS_DOLT_PORT", origPort)
 		}
 	}()
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "") // clear new primary port env so legacy path runs
 
 	os.Setenv("BEADS_TEST_MODE", "1")
 	os.Setenv("BEADS_DOLT_PORT", "13307")
@@ -256,11 +267,20 @@ func TestApplyConfigDefaults_TestModeWithPort(t *testing.T) {
 
 // TestApplyConfigDefaults_TestModeBlocksProdPort verifies that BEADS_TEST_MODE=1
 // forces port 1 even when BEADS_DOLT_PORT is explicitly set to the production port.
-// This is the fix for Clown Show #14: Gas Town's beads module injects
+// This is the fix for Clown Show #14: The orchestrator's beads module injects
 // BEADS_DOLT_PORT=3307 from metadata.json, bypassing the test mode guard.
+//
+// AD-01 (be-c5p): port == DefaultSQLPort (3307) is never suppressed by
+// BEADS_TEST_SERVER=1 (see productionPortReasons Rule 1); only the
+// BEADS_PRODUCTION_PORT and dolt-server.port heuristics honor that opt-in.
+// This case covers the no-opt-in path (operator did NOT signal "I'm on a
+// test server"), where the guard must still force port 1. See
+// TestApplyConfigDefaults_TestModeBlocksProdPort_EvenWithTestServerOptIn for
+// the opt-in case, which must reach the same outcome.
 func TestApplyConfigDefaults_TestModeBlocksProdPort(t *testing.T) {
 	origTestMode := os.Getenv("BEADS_TEST_MODE")
 	origPort := os.Getenv("BEADS_DOLT_PORT")
+	origTestServer := os.Getenv("BEADS_TEST_SERVER")
 	defer func() {
 		if origTestMode == "" {
 			os.Unsetenv("BEADS_TEST_MODE")
@@ -272,10 +292,17 @@ func TestApplyConfigDefaults_TestModeBlocksProdPort(t *testing.T) {
 		} else {
 			os.Setenv("BEADS_DOLT_PORT", origPort)
 		}
+		if origTestServer == "" {
+			os.Unsetenv("BEADS_TEST_SERVER")
+		} else {
+			os.Setenv("BEADS_TEST_SERVER", origTestServer)
+		}
 	}()
 
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "") // clear new primary port env so legacy path runs
 	os.Setenv("BEADS_TEST_MODE", "1")
 	os.Setenv("BEADS_DOLT_PORT", "3307") // Production port
+	os.Unsetenv("BEADS_TEST_SERVER")     // No test-server opt-in for this case.
 
 	cfg := &Config{}
 	applyConfigDefaults(cfg)
@@ -285,9 +312,53 @@ func TestApplyConfigDefaults_TestModeBlocksProdPort(t *testing.T) {
 	}
 }
 
+// TestApplyConfigDefaults_TestModeBlocksProdPort_EvenWithTestServerOptIn
+// verifies that BEADS_TEST_SERVER=1 does NOT suppress Rule 1 of
+// productionPortReasons (port == DefaultSQLPort): even with the operator's
+// dedicated-test-server opt-in set, port 3307 must still be forced to 1
+// under BEADS_TEST_MODE=1. Only the BEADS_PRODUCTION_PORT and
+// dolt-server.port heuristics (Rules 2 and 3) are suppressed by that
+// opt-in — the well-known default port is never suppressible, so a
+// dedicated test server must still not bind to it.
+func TestApplyConfigDefaults_TestModeBlocksProdPort_EvenWithTestServerOptIn(t *testing.T) {
+	origTestMode := os.Getenv("BEADS_TEST_MODE")
+	origPort := os.Getenv("BEADS_DOLT_PORT")
+	origTestServer := os.Getenv("BEADS_TEST_SERVER")
+	defer func() {
+		if origTestMode == "" {
+			os.Unsetenv("BEADS_TEST_MODE")
+		} else {
+			os.Setenv("BEADS_TEST_MODE", origTestMode)
+		}
+		if origPort == "" {
+			os.Unsetenv("BEADS_DOLT_PORT")
+		} else {
+			os.Setenv("BEADS_DOLT_PORT", origPort)
+		}
+		if origTestServer == "" {
+			os.Unsetenv("BEADS_TEST_SERVER")
+		} else {
+			os.Setenv("BEADS_TEST_SERVER", origTestServer)
+		}
+	}()
+
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "") // clear new primary port env so legacy path runs
+	os.Setenv("BEADS_TEST_MODE", "1")
+	os.Setenv("BEADS_DOLT_PORT", "3307") // Production port
+	os.Setenv("BEADS_TEST_SERVER", "1")  // Opt-in IS set for this case.
+
+	cfg := &Config{}
+	applyConfigDefaults(cfg)
+
+	if cfg.ServerPort != 1 {
+		t.Errorf("BEADS_TEST_MODE=1 with BEADS_DOLT_PORT=3307 should force port 1 even with "+
+			"BEADS_TEST_SERVER=1 (Rule 1 is unconditional), got %d", cfg.ServerPort)
+	}
+}
+
 // TestApplyConfigDefaults_EnvOverridesConfig verifies that BEADS_DOLT_PORT
 // overrides a port already set by metadata.json, even outside test mode.
-// This is the fix for hq-27t (test pollution): callers like Gas Town set
+// This is the fix for hq-27t (test pollution): callers like the orchestrator set
 // BEADS_DOLT_PORT to route bd to a test server instead of production.
 func TestApplyConfigDefaults_EnvOverridesConfig(t *testing.T) {
 	origTestMode := os.Getenv("BEADS_TEST_MODE")
@@ -305,7 +376,8 @@ func TestApplyConfigDefaults_EnvOverridesConfig(t *testing.T) {
 		}
 	}()
 
-	os.Unsetenv("BEADS_TEST_MODE") // NOT in test mode
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "") // clear new primary port env so legacy path runs
+	os.Unsetenv("BEADS_TEST_MODE")         // NOT in test mode
 	os.Setenv("BEADS_DOLT_PORT", "19999")
 
 	// Simulate metadata.json having set port to production default
@@ -337,6 +409,7 @@ func TestApplyConfigDefaults_ProductionFallback(t *testing.T) {
 		}
 	}()
 
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "") // clear new primary port env
 	os.Unsetenv("BEADS_TEST_MODE")
 	os.Unsetenv("BEADS_DOLT_PORT")
 
@@ -345,6 +418,118 @@ func TestApplyConfigDefaults_ProductionFallback(t *testing.T) {
 
 	if cfg.ServerPort != 0 {
 		t.Errorf("expected ServerPort=0 (ephemeral, resolved by auto-start), got %d", cfg.ServerPort)
+	}
+}
+
+func TestShouldPersistResolvedPortFile(t *testing.T) {
+	t.Run("default runtime port may be persisted", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+		t.Setenv("BEADS_DOLT_PORT", "")
+
+		if !shouldPersistResolvedPortFile() {
+			t.Fatal("expected local resolved port to be persisted")
+		}
+	})
+
+	t.Run("explicit server port is runtime override only", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SERVER_PORT", "15432")
+		t.Setenv("BEADS_DOLT_PORT", "")
+
+		if shouldPersistResolvedPortFile() {
+			t.Fatal("expected BEADS_DOLT_SERVER_PORT to suppress port file persistence")
+		}
+	})
+
+	t.Run("legacy orchestrator port is runtime override only", func(t *testing.T) {
+		t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+		t.Setenv("BEADS_DOLT_PORT", "15433")
+
+		if shouldPersistResolvedPortFile() {
+			t.Fatal("expected BEADS_DOLT_PORT to suppress port file persistence")
+		}
+	})
+}
+
+// TestApplyConfigDefaults_SocketFromEnv verifies that BEADS_DOLT_SERVER_SOCKET
+// populates ServerSocket when not already set.
+func TestApplyConfigDefaults_SocketFromEnv(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_SOCKET", "/tmp/test-dolt.sock")
+	t.Setenv("BEADS_TEST_MODE", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+
+	cfg := &Config{}
+	applyConfigDefaults(cfg)
+
+	if cfg.ServerSocket != "/tmp/test-dolt.sock" {
+		t.Errorf("expected ServerSocket from env, got %q", cfg.ServerSocket)
+	}
+}
+
+// TestApplyConfigDefaults_SocketExplicitOverridesEnv verifies that an explicit
+// ServerSocket in Config takes precedence over the env var.
+func TestApplyConfigDefaults_SocketExplicitOverridesEnv(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_SOCKET", "/tmp/env-socket.sock")
+	t.Setenv("BEADS_TEST_MODE", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+
+	cfg := &Config{ServerSocket: "/tmp/explicit.sock"}
+	applyConfigDefaults(cfg)
+
+	if cfg.ServerSocket != "/tmp/explicit.sock" {
+		t.Errorf("expected explicit socket to win, got %q", cfg.ServerSocket)
+	}
+}
+
+// TestBuildServerDSN_WithSocket verifies that buildServerDSN produces a unix
+// DSN when ServerSocket is configured.
+func TestBuildServerDSN_WithSocket(t *testing.T) {
+	cfg := &Config{
+		ServerSocket: "/tmp/dolt.sock",
+		ServerUser:   "root",
+		ServerHost:   "127.0.0.1",
+		ServerPort:   3307,
+		Database:     "testdb",
+	}
+	applyConfigDefaults(cfg)
+
+	dsn := buildServerDSN(cfg, cfg.Database)
+
+	parsed, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("failed to parse DSN: %v\n  DSN: %s", err, dsn)
+	}
+	if parsed.Net != "unix" {
+		t.Errorf("expected Net=unix, got %q", parsed.Net)
+	}
+	if parsed.Addr != "/tmp/dolt.sock" {
+		t.Errorf("expected Addr=/tmp/dolt.sock, got %q", parsed.Addr)
+	}
+	// TLS defaults to false (no TLS requested), same as TCP.
+	if parsed.TLSConfig != "false" {
+		t.Errorf("expected tls=false (default), got %q", parsed.TLSConfig)
+	}
+}
+
+// TestBuildServerDSN_WithoutSocket verifies TCP DSN is unaffected.
+func TestBuildServerDSN_WithoutSocket(t *testing.T) {
+	cfg := &Config{
+		ServerUser: "root",
+		ServerHost: "127.0.0.1",
+		ServerPort: 3307,
+		Database:   "testdb",
+	}
+	applyConfigDefaults(cfg)
+
+	dsn := buildServerDSN(cfg, cfg.Database)
+
+	parsed, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatalf("failed to parse DSN: %v\n  DSN: %s", err, dsn)
+	}
+	if parsed.Net != "tcp" {
+		t.Errorf("expected Net=tcp, got %q", parsed.Net)
 	}
 }
 
@@ -377,4 +562,154 @@ func TestExecWithLongTimeoutDSNRewrite(t *testing.T) {
 	if reParsed.ReadTimeout != 5*time.Minute {
 		t.Errorf("expected readTimeout=5m, got %v", reParsed.ReadTimeout)
 	}
+}
+
+// TestBuildServerDSN_PoolTimeouts verifies the shared pool's per-I/O deadlines:
+// 10s defaults when unset, and Config.PoolReadTimeout/PoolWriteTimeout
+// overrides carried through to the DSN (bd-vz0y9).
+func TestBuildServerDSN_PoolTimeouts(t *testing.T) {
+	tests := []struct {
+		name         string
+		readTimeout  time.Duration
+		writeTimeout time.Duration
+		wantRead     time.Duration
+		wantWrite    time.Duration
+	}{
+		{"defaults when unset", 0, 0, 10 * time.Second, 10 * time.Second},
+		{"read override only", 90 * time.Second, 0, 90 * time.Second, 10 * time.Second},
+		{"write override only", 0, 45 * time.Second, 10 * time.Second, 45 * time.Second},
+		{"both overridden", 2 * time.Minute, 30 * time.Second, 2 * time.Minute, 30 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				ServerUser:       "root",
+				ServerHost:       "127.0.0.1",
+				ServerPort:       3307,
+				Database:         "testdb",
+				PoolReadTimeout:  tt.readTimeout,
+				PoolWriteTimeout: tt.writeTimeout,
+			}
+			parsed, err := mysql.ParseDSN(buildServerDSN(cfg, cfg.Database))
+			if err != nil {
+				t.Fatalf("failed to parse DSN: %v", err)
+			}
+			if parsed.ReadTimeout != tt.wantRead {
+				t.Errorf("expected readTimeout=%v, got %v", tt.wantRead, parsed.ReadTimeout)
+			}
+			if parsed.WriteTimeout != tt.wantWrite {
+				t.Errorf("expected writeTimeout=%v, got %v", tt.wantWrite, parsed.WriteTimeout)
+			}
+		})
+	}
+}
+
+// TestParseTimeout verifies the shared duration-setting parser: ParseDuration
+// strings, bare seconds, and fallback on empty/invalid/non-positive input.
+func TestParseTimeout(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", 0},
+		{"30s", 30 * time.Second},
+		{"2m", 2 * time.Minute},
+		{"90", 90 * time.Second},
+		{" 45 ", 45 * time.Second},
+		{"bogus", 0},
+		{"-5s", 0},
+		{"0", 0},
+	}
+	for _, tt := range tests {
+		if got := parseTimeout(tt.raw, 0); got != tt.want {
+			t.Errorf("parseTimeout(%q, 0) = %v, want %v", tt.raw, got, tt.want)
+		}
+	}
+	if got := parseTimeout("bogus", 7*time.Second); got != 7*time.Second {
+		t.Errorf("parseTimeout(bogus, 7s) = %v, want fallback 7s", got)
+	}
+}
+
+// TestBuildServerDSN_SpecialCharacterPassword verifies that passwords with
+// characters that collide with DSN delimiters (@ : / ? & < > etc.) are
+// properly escaped by FormatDSN. This was a real bug — passwords from Secret
+// Manager like "zId&z,L9P4X,%k4n4rylGV<Ibos9<)/p" caused Access Denied.
+func TestBuildServerDSN_SpecialCharacterPassword(t *testing.T) {
+	tests := []struct {
+		name     string
+		password string
+	}{
+		{"ampersand and angle brackets", "zId&z,L9P4X,%k4n4rylGV<Ibos9<)/p"},
+		{"at sign and colon", "p@ss:word"},
+		{"slash and question mark", "pass/word?maybe"},
+		{"percent encoding chars", "100%done&dusted"},
+		{"empty password", ""},
+		{"alphanumeric only", "SimplePassword123"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				ServerUser:     "testuser",
+				ServerPassword: tt.password,
+				ServerHost:     "127.0.0.1",
+				ServerPort:     3308,
+				Database:       "testdb",
+			}
+			applyConfigDefaults(cfg)
+
+			dsn := buildServerDSN(cfg, cfg.Database)
+
+			// The DSN must be parseable by go-sql-driver
+			parsed, err := mysql.ParseDSN(dsn)
+			if err != nil {
+				t.Fatalf("buildServerDSN produced unparseable DSN: %v\n  DSN: %s", err, dsn)
+			}
+
+			// The parsed password must match the original exactly
+			if parsed.Passwd != tt.password {
+				t.Errorf("password roundtrip failed: got %q, want %q", parsed.Passwd, tt.password)
+			}
+
+			if parsed.User != "testuser" {
+				t.Errorf("user roundtrip failed: got %q, want %q", parsed.User, "testuser")
+			}
+
+			if parsed.DBName != "testdb" {
+				t.Errorf("database roundtrip failed: got %q, want %q", parsed.DBName, "testdb")
+			}
+		})
+	}
+}
+
+func TestShouldStopAutoStartedServerOnClose(t *testing.T) {
+	origTestMode := os.Getenv("BEADS_TEST_MODE")
+	defer func() {
+		if origTestMode == "" {
+			os.Unsetenv("BEADS_TEST_MODE")
+		} else {
+			os.Setenv("BEADS_TEST_MODE", origTestMode)
+		}
+	}()
+
+	t.Run("normal repo local server stays up", func(t *testing.T) {
+		os.Unsetenv("BEADS_TEST_MODE")
+		if shouldStopAutoStartedServerOnClose(&Config{Database: "op_broker"}) {
+			t.Fatal("expected normal repo-local auto-start to persist after Close")
+		}
+	})
+
+	t.Run("test mode still owns cleanup", func(t *testing.T) {
+		os.Setenv("BEADS_TEST_MODE", "1")
+		if !shouldStopAutoStartedServerOnClose(&Config{Database: "op_broker"}) {
+			t.Fatal("expected BEADS_TEST_MODE to keep auto-start cleanup enabled")
+		}
+	})
+
+	t.Run("test database names still clean up", func(t *testing.T) {
+		os.Unsetenv("BEADS_TEST_MODE")
+		if !shouldStopAutoStartedServerOnClose(&Config{Database: "testdb_abcdef"}) {
+			t.Fatal("expected test database names to keep auto-start cleanup enabled")
+		}
+	})
 }

@@ -29,7 +29,7 @@
 - Never create test issues in production DB (use temporary DB)
 
 ### Code Style
-- Run `golangci-lint run ./...` before committing
+- Run `make ci-pr-lint` before committing changes to Go or lint-controlled files
 - Follow existing patterns in `cmd/bd/` for new commands
 - Add `--json` flag to all commands for programmatic use
 - Update docs when changing behavior
@@ -37,6 +37,11 @@
 ### Git Workflow
 - Install git hooks: `bd hooks install`
 - Use `bd dolt push` / `bd dolt pull` for remote sync
+- Before implementing related work, opening a PR, or merging/closing a PR, run:
+  `scripts/pr-preflight.sh --search "<topic>" --repo gastownhall/beads` or
+  `scripts/pr-preflight.sh <pr-number> --repo gastownhall/beads`
+- External contributor PRs have priority: build on them when possible, preserve
+  tests and attribution, and never close or replace them silently.
 
 ## Issue Tracking with bd
 

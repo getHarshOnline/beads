@@ -1,4 +1,8 @@
+# Keep repository text deterministic on every host. The global rule makes future
+# text formats opt in automatically and protects LF-sensitive hook templates,
+# embedded Markdown bytes, migration content hashes, and generated-doc byte
+# comparisons without requiring workstation Git configuration.
+* text=auto eol=lf
 
-# Shell scripts must always use LF line endings (especially git hook templates)
-*.sh text eol=lf
-cmd/bd/templates/hooks/* text eol=lf
+# Tracked binary assets must never pass through text conversion or text diffs.
+*.jpg binary

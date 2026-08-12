@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
 )
 
 // Tests for the CreateIfMissing guard on CREATE DATABASE.
@@ -34,7 +37,7 @@ import (
 // a database. Caller must defer db.Close().
 func rawTestConn(t *testing.T, port int) *sql.DB {
 	t.Helper()
-	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%d)/", port)
+	dsn := doltutil.ServerDSN{Host: "127.0.0.1", Port: port, User: "root"}.String()
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		t.Fatalf("failed to connect to test server on port %d: %v", port, err)
@@ -211,6 +214,48 @@ func TestCreateGuard_ExistingDB_NoFlag(t *testing.T) {
 		t.Fatalf("expected success opening existing database, got: %v", err)
 	}
 	defer store.Close()
+}
+
+// TestCreateGuard_ExistingDB_DoesNotCreateMissingBeadsDir verifies that a
+// normal write-capable store open does not materialize a missing .beads/
+// directory as a side effect. Only explicit init/bootstrap-style flows should
+// create local filesystem state.
+func TestCreateGuard_ExistingDB_DoesNotCreateMissingBeadsDir(t *testing.T) {
+	skipIfNoServer(t)
+
+	ctx := context.Background()
+	baseDir := t.TempDir()
+	beadsDir := filepath.Join(baseDir, ".beads")
+	dbPath := filepath.Join(beadsDir, "dolt")
+	dbName := fmt.Sprintf("test_guard_missing_beads_%d", testServerPort)
+
+	createTestDatabase(t, testServerPort, dbName)
+	t.Cleanup(func() { dropTestDatabase(t, testServerPort, dbName) })
+
+	cfg := &Config{
+		Path:         dbPath,
+		BeadsDir:     beadsDir,
+		ServerHost:   "127.0.0.1",
+		ServerPort:   testServerPort,
+		Database:     dbName,
+		MaxOpenConns: 1,
+	}
+
+	store, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("expected success opening existing database, got: %v", err)
+	}
+	defer store.Close()
+
+	if _, err := os.Stat(beadsDir); !os.IsNotExist(err) {
+		t.Fatalf("expected missing beadsDir to stay absent, got err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(beadsDir, credentialKeyFile)); !os.IsNotExist(err) {
+		t.Fatalf("expected no credential key side effect, got err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(beadsDir, "dolt-server.port")); !os.IsNotExist(err) {
+		t.Fatalf("expected no port-file side effect, got err=%v", err)
+	}
 }
 
 // TestCreateGuard_ExistingDB_WithData verifies that data is preserved when
@@ -405,50 +450,5 @@ func TestCreateGuard_ErrorMessage(t *testing.T) {
 	// Should suggest bd doctor
 	if !strings.Contains(errMsg, "bd doctor") {
 		t.Errorf("error should suggest 'bd doctor', got: %s", errMsg)
-	}
-}
-
-// --- Auto-start guard tests ---
-
-// TestAutoStart_DisabledWithExplicitPort verifies that auto-start is disabled
-// when the config file specifies an explicit server port. This prevents
-// bd from launching a different server when the configured one is down.
-func TestAutoStart_DisabledWithExplicitPort(t *testing.T) {
-	t.Chdir(t.TempDir())
-	t.Setenv("BEADS_TEST_MODE", "")
-	t.Setenv("GT_ROOT", "")
-	t.Setenv("BEADS_DOLT_AUTO_START", "")
-
-	got := resolveAutoStart(false, "", true)
-	if got != false {
-		t.Error("resolveAutoStart should return false when explicit port is configured")
-	}
-}
-
-// TestAutoStart_ExplicitPort_CallerOverrideIgnored verifies that even a caller
-// requesting AutoStart=true is overridden when an explicit port is configured.
-func TestAutoStart_ExplicitPort_CallerOverrideIgnored(t *testing.T) {
-	t.Chdir(t.TempDir())
-	t.Setenv("BEADS_TEST_MODE", "")
-	t.Setenv("GT_ROOT", "")
-	t.Setenv("BEADS_DOLT_AUTO_START", "")
-
-	got := resolveAutoStart(true, "", true)
-	if got != false {
-		t.Error("resolveAutoStart should return false with explicit port even when caller requests true")
-	}
-}
-
-// TestAutoStart_ExplicitPort_EnvOverrideStillWins verifies that BEADS_DOLT_AUTO_START=0
-// still takes precedence even without explicit port (defense-in-depth).
-func TestAutoStart_ExplicitPort_EnvOverrideStillWins(t *testing.T) {
-	t.Chdir(t.TempDir())
-	t.Setenv("BEADS_TEST_MODE", "")
-	t.Setenv("GT_ROOT", "")
-	t.Setenv("BEADS_DOLT_AUTO_START", "0")
-
-	got := resolveAutoStart(true, "", false) // no explicit port, but env says no
-	if got != false {
-		t.Error("BEADS_DOLT_AUTO_START=0 should still disable auto-start without explicit port")
 	}
 }

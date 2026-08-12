@@ -3,11 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -23,13 +21,9 @@ func issueIDCompletion(cmd *cobra.Command, args []string, toComplete string) ([]
 	// Get database path - use same logic as in PersistentPreRun
 	currentDBPath := dbPath
 	if currentDBPath == "" {
-		// Try to find database path
-		foundDB := beads.FindDatabasePath()
-		if foundDB != "" {
-			currentDBPath = foundDB
-		} else {
-			// Default path
-			currentDBPath = filepath.Join(".beads", beads.CanonicalDatabaseName)
+		currentDBPath = beads.FindDatabasePath()
+		if currentDBPath == "" {
+			return nil, cobra.ShellCompDirectiveNoFileComp
 		}
 	}
 
@@ -37,7 +31,7 @@ func issueIDCompletion(cmd *cobra.Command, args []string, toComplete string) ([]
 	currentStore := store
 	if currentStore == nil {
 		var err error
-		currentStore, err = dolt.New(ctx, &dolt.Config{Path: currentDBPath, ReadOnly: true})
+		currentStore, err = openReadOnlyStoreForDBPath(ctx, currentDBPath)
 		if err != nil {
 			// If we can't open database, return empty completion
 			return nil, cobra.ShellCompDirectiveNoFileComp

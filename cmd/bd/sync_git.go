@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/doltremote"
 )
 
 // isGitRepo checks if the current working directory is in a git repository.
@@ -65,6 +68,73 @@ func gitHasAnyRemotes() bool {
 		return false
 	}
 	return strings.TrimSpace(string(output)) != ""
+}
+
+// gitOriginGetURL returns the URL for the origin git remote.
+func gitOriginGetURL() (string, error) {
+	cmd := exec.Command("git", "remote", "get-url", "origin")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func gitOriginGetURLForActiveRepo(ctx context.Context) (string, error) {
+	rc, err := beads.GetRepoContext()
+	if err != nil {
+		return "", err
+	}
+	cmd := rc.GitCmd(ctx, "remote", "get-url", "origin")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// gitOriginHasDoltDataRef checks if origin has refs/dolt/data.
+// Returns false on any error (network, no remote, timeout, etc).
+// Uses a 10s timeout since this is a network call used for auto-detection,
+// and suppresses credential prompts to avoid blocking on SSH remotes.
+func gitOriginHasDoltDataRef() bool {
+	return gitRemoteHasDoltDataRef("origin")
+}
+
+func gitRemoteHasDoltDataRef(remote string) bool {
+	hasData, err := gitRemoteHasDoltDataRefStatus(remote)
+	return err == nil && hasData
+}
+
+// gitOriginHasDoltDataRefStatus is the tri-state form: no data vs. unknown.
+func gitOriginHasDoltDataRefStatus() (bool, error) {
+	return gitRemoteHasDoltDataRefStatus("origin")
+}
+
+// A non-nil error means UNKNOWN, not "no data" — the bool is meaningless.
+func gitRemoteHasDoltDataRefStatus(remote string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "ls-remote", gitRemoteURLForLsRemote(remote), "refs/dolt/data")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	output, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("probe refs/dolt/data on %s: %w", remote, err)
+	}
+	return strings.TrimSpace(string(output)) != "", nil
+}
+
+func gitRemoteURLForLsRemote(remote string) string {
+	return strings.TrimPrefix(remote, "git+")
+}
+
+// gitURLToDoltRemote converts a git remote URL to dolt's remote format.
+// HTTPS URLs get "git+" prefix: https://... → git+https://...
+// SCP-style SSH URLs are converted: git@host:path → git+ssh://git@host/path
+// SSH URLs get "git+" prefix: ssh://... → git+ssh://...
+// URLs that already have "git+" prefix are returned as-is.
+func gitURLToDoltRemote(url string) string {
+	return doltremote.FromGitURL(url)
 }
 
 // gitBranchHasUpstream checks if a specific branch has an upstream configured.

@@ -54,31 +54,6 @@ func TestFormatTimeAgo(t *testing.T) {
 	}
 }
 
-func TestContainsLabel(t *testing.T) {
-	tests := []struct {
-		name   string
-		labels []string
-		label  string
-		want   bool
-	}{
-		{"empty labels", []string{}, "bug", false},
-		{"single match", []string{"bug"}, "bug", true},
-		{"no match", []string{"feature", "enhancement"}, "bug", false},
-		{"match in list", []string{"bug", "feature", "urgent"}, "feature", true},
-		{"case sensitive", []string{"Bug"}, "bug", false},
-		{"nil labels", nil, "bug", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := containsLabel(tt.labels, tt.label)
-			if got != tt.want {
-				t.Errorf("containsLabel(%v, %q) = %v, want %v", tt.labels, tt.label, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestGetContributorsSorted(t *testing.T) {
 	// Test that contributors are returned in sorted order by commit count
 	contributors := getContributorsSorted()
@@ -138,6 +113,7 @@ func TestTruncate(t *testing.T) {
 		{"truncate needed", "long string here", 10, "long st..."},
 		{"very short max", "hello world", 5, "he..."},
 		{"empty string", "", 5, ""},
+		{"utf8 mid rune", "reestruturacao \u2014 continua", 19, "reestruturacao ..."},
 	}
 
 	for _, tt := range tests {

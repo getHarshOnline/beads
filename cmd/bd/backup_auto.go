@@ -4,49 +4,96 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/storage"
 )
 
 // isBackupAutoEnabled returns whether backup should run.
 // If user explicitly configured backup.enabled, use that.
-// Otherwise, auto-enable when a git remote exists.
+// Otherwise auto-enable when a git remote exists — BUT only in
+// embedded mode.
+//
+// In sql-server / shared-server mode (usesSQLServer()) the default is
+// OFF: N bd clients share a single Dolt server, and the Dolt-native
+// backup path (store.BackupDatabase) registers a server-side backup
+// remote under one fixed name pointing at THIS client's local
+// .beads/backup dir, then full-syncs the whole DB. With many clients
+// that means racing remove/add of the same name plus every client
+// full-syncing the entire history into its own dir — the amplifier
+// behind the 2026-07 shared-dolt CPU-pin incident. Operators who want
+// backups in server mode must opt in explicitly (backup.enabled=true
+// / BD_BACKUP_ENABLED=1) and coordinate destinations themselves.
 func isBackupAutoEnabled() bool {
 	if config.GetValueSource("backup.enabled") != config.SourceDefault {
 		return config.GetBool("backup.enabled")
 	}
+	if usesSQLServer() {
+		return false
+	}
 	return primeHasGitRemote()
 }
 
-// isBackupGitPushEnabled returns whether git commit+push should run after backup.
-// Defaults to OFF — requires explicit opt-in via backup.git-push: true in config.yaml
-// or BD_BACKUP_GIT_PUSH=true environment variable.
+// clientServerShareFilesystem reports whether the configured Dolt
+// server runs on a filesystem the bd client can also see — i.e.
+// whether a file:// URL constructed on the client is meaningful to
+// the server.
 //
-// Git backup accumulates commits without bound and pushes to whatever default
-// remote exists, which may not be the intended target. Users who want this
-// behavior must explicitly enable it.
+// Returns true when the host is empty / localhost (embedded mode or
+// local server), false when the host is set to a non-localhost
+// value (external server in a container or remote machine).
 //
-// Always disabled in stealth mode (no-git-ops) — stealth means no git operations.
-func isBackupGitPushEnabled() bool {
-	if config.GetBool("no-git-ops") {
-		return false
+// Used by maybeAutoBackup to skip the file:// auto-register that
+// would otherwise fail every command (GH#3523). External-server
+// operators who want auto-backup must configure an URL scheme that
+// works cross-filesystem (s3://, gs://, etc.) — auto-backup's
+// hardcoded file:// path can't help them.
+//
+// Detection follows the same effective-host precedence as
+// configfile.GetDoltServerHost / HostImpliesServerMode (env >
+// metadata.json > config.yaml, GH#3545), so a workspace whose remote
+// host lives only in metadata.json is classified the same way here as
+// by mode inference — the operator's intent is unambiguous from the
+// effective host value alone.
+func clientServerShareFilesystem() bool {
+	host := os.Getenv("BEADS_DOLT_SERVER_HOST")
+	if host == "" {
+		if bd := beads.FindBeadsDir(); bd != "" {
+			if cfg, err := configfile.Load(bd); err == nil && cfg != nil {
+				// An explicit dolt_mode=embedded pins local storage;
+				// a leftover dolt_server_host is inert then (same
+				// gate as HostImpliesServerMode), so local
+				// auto-backup stays available.
+				if !strings.EqualFold(cfg.DoltMode, configfile.DoltModeEmbedded) {
+					host = cfg.DoltServerHost
+				}
+			}
+		}
 	}
-	if config.GetValueSource("backup.git-push") != config.SourceDefault {
-		return config.GetBool("backup.git-push")
+	if host == "" {
+		// Fall back to in-struct config (config.yaml dolt.host etc.).
+		host = config.GetString("dolt.host")
 	}
-	return false
+	return configfile.IsLocalHostString(host)
 }
 
-// maybeAutoBackup runs a JSONL backup if enabled and the throttle interval has passed.
+// autoBackupSkipNoticeOnce ensures the "auto-backup skipped" INFO
+// message fires at most once per process — operators running long
+// bd sessions don't need a chatty repeat on every command.
+var autoBackupSkipNoticeOnce sync.Once
+
+// maybeAutoBackup runs a Dolt-native backup if enabled and the throttle interval has passed.
 // Called from PersistentPostRun after auto-commit.
 func maybeAutoBackup(ctx context.Context) {
 	// Skip backup entirely when running as a git hook (post-checkout, post-merge, etc.).
 	// Git hooks call 'bd hooks run' which goes through PersistentPostRun — without this
-	// guard, every git checkout/merge/rebase triggers a backup commit on the current branch.
+	// guard, every git checkout/merge/rebase triggers a backup on the current branch.
 	if os.Getenv("BD_GIT_HOOK") == "1" {
 		debug.Logf("backup: skipping — running as git hook\n")
 		return
@@ -55,19 +102,42 @@ func maybeAutoBackup(ctx context.Context) {
 	if !isBackupAutoEnabled() {
 		return
 	}
-	if store == nil || store.IsClosed() {
+	if store == nil {
+		return
+	}
+	if lm, ok := storage.UnwrapStore(store).(storage.LifecycleManager); ok && lm.IsClosed() {
+		return
+	}
+
+	// GH#3523: when the Dolt server runs on a different filesystem
+	// from this client (operator's BEADS_DOLT_SERVER_HOST points at a
+	// non-localhost value), the file:// URL the auto-backup path
+	// constructs is meaningless to the server — register fails on
+	// every command. Skip cleanly with a one-time INFO so operators
+	// know auto-backup is silent on purpose.
+	if !clientServerShareFilesystem() {
+		autoBackupSkipNoticeOnce.Do(func() {
+			if !isQuiet() && !jsonOutput {
+				fmt.Fprintln(os.Stderr,
+					"Info: auto-backup skipped — server filesystem differs "+
+						"from client (BEADS_DOLT_SERVER_HOST is non-localhost).\n"+
+						"      Configure backup.url=s3://... or run `bd backup` "+
+						"manually for cross-filesystem backups.")
+			}
+		})
+		debug.Logf("backup: skipping — server on remote filesystem\n")
 		return
 	}
 
 	dir, err := backupDir()
 	if err != nil {
-		debug.Logf("backup: failed to get backup dir: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Warning: auto-backup skipped: %v\n", err)
 		return
 	}
 
 	state, err := loadBackupState(dir)
 	if err != nil {
-		debug.Logf("backup: failed to load state: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Warning: auto-backup skipped: %v\n", err)
 		return
 	}
 
@@ -85,7 +155,7 @@ func maybeAutoBackup(ctx context.Context) {
 	// Change detection: skip if nothing changed
 	currentCommit, err := store.GetCurrentCommit(ctx)
 	if err != nil {
-		debug.Logf("backup: failed to get current commit: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Warning: auto-backup skipped: failed to get current commit: %v\n", err)
 		return
 	}
 	if currentCommit == state.LastDoltCommit && state.LastDoltCommit != "" {
@@ -93,38 +163,14 @@ func maybeAutoBackup(ctx context.Context) {
 		return
 	}
 
-	// Run the export (force=true since we already checked change detection above)
-	newState, err := runBackupExport(ctx, true)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: auto-backup failed: %v\n", err)
+	// Run the backup (force=true since we already checked change detection above)
+	if _, err := runBackupExport(ctx, true); err != nil {
+		if !isQuiet() && !jsonOutput {
+			fmt.Fprintf(os.Stderr, "Warning: auto-backup failed: %v\n", err)
+		}
+		debug.Logf("backup: error: %v\n", err)
 		return
 	}
 
-	debug.Logf("backup: exported %d issues, %d events, %d comments\n",
-		newState.Counts.Issues, newState.Counts.Events, newState.Counts.Comments)
-
-	// Optional git push — only on default branch to avoid polluting feature branches.
-	if isBackupGitPushEnabled() {
-		if branch, err := currentGitBranch(); err == nil && !isDefaultBranch(branch) {
-			debug.Logf("backup: skipping git commit — on branch %q (not default)\n", branch)
-		} else if err := gitBackup(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: backup git push failed: %v\n", err)
-		}
-	}
-}
-
-// currentGitBranch returns the current git branch name.
-// Returns an error if not in a git repo or HEAD is detached.
-func currentGitBranch() (string, error) {
-	cmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-// isDefaultBranch returns true if the given branch name is a default/primary branch.
-func isDefaultBranch(branch string) bool {
-	return branch == "main" || branch == "master"
+	debug.Logf("backup: completed successfully\n")
 }

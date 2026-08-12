@@ -4,8 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -14,8 +12,9 @@ import (
 
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
-	"github.com/steveyegge/beads/internal/lockfile"
+
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
 )
 
 // openDoltDB opens a connection to the Dolt SQL server via MySQL protocol.
@@ -24,11 +23,13 @@ func openDoltDB(beadsDir string) (*sql.DB, *configfile.Config, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to load config: %w", err)
 	}
+	if cfg == nil {
+		return nil, nil, fmt.Errorf("no beads configuration found in %s", beadsDir)
+	}
 
-	host := configfile.DefaultDoltServerHost
-	user := configfile.DefaultDoltServerUser
-	database := configfile.DefaultDoltDatabase
-	password := os.Getenv("BEADS_DOLT_PASSWORD")
+	host := cfg.GetDoltServerHost()
+	user := cfg.GetDoltServerUser()
+	database := cfg.GetDoltDatabase()
 
 	// Use doltserver.DefaultConfig for port resolution (env > port file > config.yaml).
 	// Port 0 means no server running yet.
@@ -38,20 +39,22 @@ func openDoltDB(beadsDir string) (*sql.DB, *configfile.Config, error) {
 		return nil, nil, fmt.Errorf("no Dolt server port configured and no server running; run any bd command to auto-start")
 	}
 
-	if cfg != nil {
-		host = cfg.GetDoltServerHost()
-		user = cfg.GetDoltServerUser()
-		database = cfg.GetDoltDatabase()
-	}
+	// Resolve the password using the credentials file fallback keyed by the
+	// resolved runtime port — matching the CRUD path. Env var BEADS_DOLT_PASSWORD
+	// still takes precedence inside GetDoltServerPasswordForPort. Without this,
+	// externally-hosted Dolt servers that keep credentials in
+	// ~/.config/beads/credentials fail doctor checks with "Access denied" while
+	// regular CRUD commands succeed (bd-h5k7).
+	password := cfg.GetDoltServerPasswordForPort(port)
 
-	var connStr string
-	if password != "" {
-		connStr = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&timeout=5s",
-			user, password, host, port, database)
-	} else {
-		connStr = fmt.Sprintf("%s@tcp(%s:%d)/%s?parseTime=true&timeout=5s",
-			user, host, port, database)
-	}
+	connStr := doltutil.ServerDSN{
+		Host:     host,
+		Port:     port,
+		User:     user,
+		Password: password,
+		Database: database,
+		TLS:      cfg.GetDoltServerTLS(),
+	}.String()
 
 	db, err := sql.Open("mysql", connStr)
 	if err != nil {
@@ -98,9 +101,10 @@ func openDoltConn(beadsDir string) (*doltConn, error) {
 	return &doltConn{db: db, cfg: cfg, port: port}, nil
 }
 
-// GetBackend returns the configured backend type from configuration.
-// It checks config.yaml first (storage-backend key), then falls back to metadata.json.
-// Returns "dolt" (default) or "sqlite" (legacy).
+// GetBackend returns the configured backend type from metadata.json. An absent
+// or empty backend field reads as "dolt" (the default); removed-backend
+// tombstones ("postgres", "mysql", "sqlite") are returned verbatim so callers
+// can label them without opening anything.
 // hq-3446fc.17: Use dolt.GetBackendFromConfig for consistent backend detection.
 func GetBackend(beadsDir string) string {
 	return dolt.GetBackendFromConfig(beadsDir)
@@ -114,41 +118,55 @@ func IsDoltBackend(beadsDir string) bool {
 // RunDoltHealthChecks runs all Dolt-specific health checks using a single
 // shared server connection. Returns one check per health dimension.
 // Non-Dolt backends get N/A results for all dimensions.
-//
-// Note: Prefer RunDoltHealthChecksWithLock when the lock check has already
-// been run early (before any embedded Dolt opens) to avoid false positives.
 func RunDoltHealthChecks(path string) []DoctorCheck {
-	return RunDoltHealthChecksWithLock(path, CheckLockHealth(path))
+	return runDoltHealthChecksInternal(path)
 }
 
-// RunDoltHealthChecksWithLock is like RunDoltHealthChecks but accepts a
-// pre-computed lock health check result. This allows the caller to run
-// CheckLockHealth before any checks that open embedded Dolt databases,
-// avoiding false positives from doctor's own noms LOCK files (GH#1981).
-func RunDoltHealthChecksWithLock(path string, lockCheck DoctorCheck) []DoctorCheck {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+func runDoltHealthChecksInternal(path string) []DoctorCheck {
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	if !IsDoltBackend(beadsDir) {
 		return []DoctorCheck{
-			{Name: "Dolt Connection", Status: StatusOK, Message: "N/A (SQLite backend)", Category: CategoryCore},
-			{Name: "Dolt Schema", Status: StatusOK, Message: "N/A (SQLite backend)", Category: CategoryCore},
-			{Name: "Dolt Issue Count", Status: StatusOK, Message: "N/A (SQLite backend)", Category: CategoryData},
-			{Name: "Dolt Status", Status: StatusOK, Message: "N/A (SQLite backend)", Category: CategoryData},
-			{Name: "Dolt Lock Health", Status: StatusOK, Message: "N/A (SQLite backend)", Category: CategoryRuntime},
-			{Name: "Phantom Databases", Status: StatusOK, Message: "N/A (SQLite backend)", Category: CategoryData},
-			{Name: "Shared Server", Status: StatusOK, Message: "N/A (SQLite backend)", Category: CategoryRuntime},
+			{Name: "Dolt Connection", Status: StatusOK, Message: "N/A (non-Dolt backend)", Category: CategoryCore},
+			{Name: "Dolt Schema", Status: StatusOK, Message: "N/A (non-Dolt backend)", Category: CategoryCore},
+			{Name: "Dolt Issue Count", Status: StatusOK, Message: "N/A (non-Dolt backend)", Category: CategoryData},
+			{Name: "Dolt Status", Status: StatusOK, Message: "N/A (non-Dolt backend)", Category: CategoryData},
+			{Name: "Dolt Lock Health", Status: StatusOK, Message: "N/A (non-Dolt backend)", Category: CategoryRuntime},
+			{Name: "Phantom Databases", Status: StatusOK, Message: "N/A (non-Dolt backend)", Category: CategoryData},
+			{Name: "Shared Server", Status: StatusOK, Message: "N/A (non-Dolt backend)", Category: CategoryRuntime},
 		}
 	}
 
 	conn, err := openDoltConn(beadsDir)
 	if err != nil {
+		// GH#2722: When no server is running and the mode is not external
+		// (i.e., no expectation of a persistent server), skip server-dependent
+		// checks gracefully instead of reporting false errors. The SharedStore-
+		// based embedded checks already validate data integrity; the server
+		// will auto-start on the next bd command.
+		serverMode := doltserver.DefaultConfig(beadsDir).Mode
+		if serverMode != doltserver.ServerModeExternal {
+			skipMsg := "Skipped (no server running; will auto-start on next bd command)"
+			return []DoctorCheck{
+				{Name: "Dolt Connection", Status: StatusOK, Message: skipMsg, Category: CategoryCore},
+				{Name: "Dolt Schema", Status: StatusOK, Message: skipMsg, Category: CategoryCore},
+				{Name: "Dolt Issue Count", Status: StatusOK, Message: skipMsg, Category: CategoryData},
+				{Name: "Dolt Status", Status: StatusOK, Message: skipMsg, Category: CategoryData},
+				{Name: "Dolt Lock Health", Status: StatusOK, Message: "N/A (removed)", Category: CategoryRuntime},
+				{Name: "Phantom Databases", Status: StatusOK, Message: skipMsg, Category: CategoryData},
+				checkSharedServerHealth(beadsDir),
+			}
+		}
+
+		// External/shared server mode: a server is expected to be running,
+		// so connection failure is a real error.
 		connErr := err.Error()
 		return []DoctorCheck{
 			{Name: "Dolt Connection", Status: StatusError, Message: "Failed to connect to Dolt server", Detail: connErr, Fix: "Ensure dolt sql-server is running, or check server host/port configuration", Category: CategoryCore},
 			{Name: "Dolt Schema", Status: StatusError, Message: "Skipped (no connection)", Detail: connErr, Category: CategoryCore},
 			{Name: "Dolt Issue Count", Status: StatusError, Message: "Skipped (no connection)", Detail: connErr, Category: CategoryData},
 			{Name: "Dolt Status", Status: StatusError, Message: "Skipped (no connection)", Detail: connErr, Category: CategoryData},
-			lockCheck,
+			{Name: "Dolt Lock Health", Status: StatusOK, Message: "N/A (removed)", Category: CategoryRuntime},
 			{Name: "Phantom Databases", Status: StatusError, Message: "Skipped (no connection)", Detail: connErr, Category: CategoryData},
 			checkSharedServerHealth(beadsDir),
 		}
@@ -160,7 +178,7 @@ func RunDoltHealthChecksWithLock(path string, lockCheck DoctorCheck) []DoctorChe
 		checkSchemaWithDB(conn),
 		checkIssueCountWithDB(conn),
 		checkStatusWithDB(conn),
-		lockCheck,
+		{Name: "Dolt Lock Health", Status: StatusOK, Message: "N/A (removed)", Category: CategoryRuntime},
 		checkPhantomDatabases(conn),
 		checkSharedServerHealth(beadsDir),
 	}
@@ -199,7 +217,7 @@ func checkConnectionWithDB(conn *doltConn) DoctorCheck {
 // This is the standalone entry point; RunDoltHealthChecks is preferred
 // for coordinated access.
 func CheckDoltConnection(path string) DoctorCheck {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	// Only run this check for Dolt backend
 	if !IsDoltBackend(beadsDir) {
@@ -268,24 +286,27 @@ func checkSchemaWithDB(conn *doltConn) DoctorCheck {
 		}
 	}
 
-	// Check dolt_ignore'd tables (wisps) — these only exist in the working
-	// set and must be recreated each server session. (GH#2271)
-	wispTables := []string{"wisps", "wisp_labels", "wisp_dependencies", "wisp_events", "wisp_comments"}
-	var missingWispTables []string
-	for _, table := range wispTables {
+	// Check dolt_ignore'd tables — these only exist in the working set and
+	// must be recreated each server session. (GH#2271)
+	ignoredTables := []string{
+		"events", "leases", "local_metadata", "repo_mtimes",
+		"wisps", "wisp_labels", "wisp_dependencies", "wisp_events", "wisp_comments",
+	}
+	var missingIgnoredTables []string
+	for _, table := range ignoredTables {
 		var count int
 		err := conn.db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s LIMIT 1", table)).Scan(&count)
 		if err != nil {
-			missingWispTables = append(missingWispTables, table)
+			missingIgnoredTables = append(missingIgnoredTables, table)
 		}
 	}
 
-	if len(missingWispTables) > 0 {
+	if len(missingIgnoredTables) > 0 {
 		return DoctorCheck{
 			Name:     "Dolt Schema",
 			Status:   StatusWarning,
-			Message:  fmt.Sprintf("Missing ephemeral tables: %v (will be recreated on next bd command)", missingWispTables),
-			Detail:   "Wisps tables are dolt_ignore'd and must be recreated each server session (GH#2271)",
+			Message:  fmt.Sprintf("Missing dolt_ignore'd tables: %v (will be recreated on next bd command)", missingIgnoredTables),
+			Detail:   "dolt_ignore'd tables live in the working set and must be recreated each server session",
 			Fix:      "Run any bd command to trigger automatic recreation, or restart the Dolt server",
 			Category: CategoryCore,
 		}
@@ -303,7 +324,7 @@ func checkSchemaWithDB(conn *doltConn) DoctorCheck {
 // This is the standalone entry point; RunDoltHealthChecks is preferred
 // for coordinated access.
 func CheckDoltSchema(path string) DoctorCheck {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	// Only run for Dolt backend
 	if !IsDoltBackend(beadsDir) {
@@ -358,7 +379,7 @@ func checkIssueCountWithDB(conn *doltConn) DoctorCheck {
 // This is the standalone entry point; RunDoltHealthChecks is preferred
 // for coordinated access.
 func CheckDoltIssueCount(path string) DoctorCheck {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	// Only run for Dolt backend
 	if !IsDoltBackend(beadsDir) {
@@ -385,12 +406,80 @@ func CheckDoltIssueCount(path string) DoctorCheck {
 	return checkIssueCountWithDB(conn)
 }
 
-// isWispTable returns true if the table name refers to a wisp (ephemeral) table.
-// Wisp tables are expected to have uncommitted changes since they are excluded
+// isIgnoredTable returns true if the table name refers to a dolt_ignore'd table.
+// These tables are expected to have uncommitted changes since they are excluded
 // from Dolt version tracking via dolt_ignore. Reporting them as uncommitted
 // produces self-fulfilling warnings that can never be cleared.
-func isWispTable(tableName string) bool {
-	return tableName == "wisps" || strings.HasPrefix(tableName, "wisp_")
+func isIgnoredTable(tableName string) bool {
+	switch tableName {
+	case "wisps", "leases", "local_metadata", "repo_mtimes", "events":
+		return true
+	}
+	return strings.HasPrefix(tableName, "wisp_")
+}
+
+// doltStatusRow is one row of the dolt_status system table.
+type doltStatusRow struct {
+	table  string
+	staged bool
+	status string
+}
+
+// scanDoltStatus reads a `SELECT table_name, staged, status FROM dolt_status`
+// result set. Rows that fail to scan are skipped rather than aborting the
+// health check: a doctor check reporting what it could read beats one that
+// reports nothing.
+func scanDoltStatus(rows *sql.Rows) ([]doltStatusRow, error) {
+	var out []doltStatusRow
+	for rows.Next() {
+		var r doltStatusRow
+		if err := rows.Scan(&r.table, &r.staged, &r.status); err != nil {
+			continue
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// describeUncommittedTables drops dolt_ignore'd tables from a dolt_status scan
+// and renders the rest as human-readable "table: status (staged)" strings.
+//
+// Every uncommitted-changes check in doctor must funnel through this function.
+// Two of them previously kept private skip-lists that drifted apart — "Dolt
+// Locks" excluded only wisp tables while "Dolt Status" excluded the full
+// ignored set — so the same clean store was clean by one check and dirty by
+// the other, permanently. One filter, one source of truth.
+//
+// The filter is a static name list rather than a read of the store's own
+// dolt_ignore rows, which is worth explaining because the reverse looks
+// obvious. dolt_ignore does not mean "do not report changes to this table".
+// Per doltdb.ShouldIgnoreDelta, "only newly added or dropped tables are
+// matched against the patterns. Changes to already tracked tables are always
+// included." Every table listed here is tracked, so Dolt reports it dirty
+// forever by design and dolt_ignore has no say in it. Deriving the skip-set
+// from that table would therefore borrow a mechanism that answers a different
+// question, and would additionally require reimplementing Dolt's pattern
+// syntax — doltdb.compilePattern treats '*' and '?' and '%' as wildcards, '_'
+// as a literal, and matches case-sensitively, none of which is SQL LIKE.
+//
+// Silencing these tables is a beads decision about which tables are
+// bookkeeping, so it belongs in beads code. See isIgnoredTable.
+func describeUncommittedTables(rows []doltStatusRow) []string {
+	var changes []string
+	for _, r := range rows {
+		if isIgnoredTable(r.table) {
+			continue
+		}
+		mark := ""
+		if r.staged {
+			mark = " (staged)"
+		}
+		changes = append(changes, fmt.Sprintf("%s: %s%s", r.table, r.status, mark))
+	}
+	return changes
 }
 
 // checkStatusWithDB reports uncommitted changes in Dolt using an existing connection.
@@ -411,26 +500,8 @@ func checkStatusWithDB(conn *doltConn) DoctorCheck {
 	}
 	defer rows.Close()
 
-	var changes []string
-	for rows.Next() {
-		var tableName string
-		var staged bool
-		var status string
-		if err := rows.Scan(&tableName, &staged, &status); err != nil {
-			continue
-		}
-		// Skip wisp tables — they are ephemeral and expected to have
-		// uncommitted changes (covered by dolt_ignore).
-		if isWispTable(tableName) {
-			continue
-		}
-		stageMark := ""
-		if staged {
-			stageMark = "(staged)"
-		}
-		changes = append(changes, fmt.Sprintf("%s: %s %s", tableName, status, stageMark))
-	}
-	if err := rows.Err(); err != nil {
+	scanned, err := scanDoltStatus(rows)
+	if err != nil {
 		return DoctorCheck{
 			Name:     "Dolt Status",
 			Status:   StatusWarning,
@@ -439,6 +510,7 @@ func checkStatusWithDB(conn *doltConn) DoctorCheck {
 			Category: CategoryData,
 		}
 	}
+	changes := describeUncommittedTables(scanned)
 
 	if len(changes) > 0 {
 		return DoctorCheck{
@@ -463,7 +535,7 @@ func checkStatusWithDB(conn *doltConn) DoctorCheck {
 // This is the standalone entry point; RunDoltHealthChecks is preferred
 // for coordinated access.
 func CheckDoltStatus(path string) DoctorCheck {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	// Only run for Dolt backend
 	if !IsDoltBackend(beadsDir) {
@@ -488,85 +560,6 @@ func CheckDoltStatus(path string) DoctorCheck {
 	defer conn.Close()
 
 	return checkStatusWithDB(conn)
-}
-
-// CheckLockHealth checks the health of Dolt lock files.
-// It probes for stale noms LOCK files and checks whether the advisory lock
-// is currently held, providing actionable guidance when issues are found.
-func CheckLockHealth(path string) DoctorCheck {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
-
-	if !IsDoltBackend(beadsDir) {
-		return DoctorCheck{
-			Name:     "Dolt Lock Health",
-			Status:   StatusOK,
-			Message:  "N/A (not using Dolt backend)",
-			Category: CategoryRuntime,
-		}
-	}
-
-	var warnings []string
-
-	// Check for noms LOCK files that are actively held by another process.
-	// Dolt's noms chunk store creates a LOCK file on open and releases the
-	// flock on close, but never deletes the file. We probe the flock to
-	// distinguish an actively held lock (real contention) from a stale
-	// file left by a previous process (harmless).
-	doltDir := getDatabasePath(beadsDir)
-	if dbEntries, err := os.ReadDir(doltDir); err == nil {
-		for _, dbEntry := range dbEntries {
-			if !dbEntry.IsDir() {
-				continue
-			}
-			nomsLock := filepath.Join(doltDir, dbEntry.Name(), ".dolt", "noms", "LOCK")
-			if f, err := os.OpenFile(nomsLock, os.O_RDWR, 0); err == nil { //nolint:gosec // controlled path
-				if lockErr := lockfile.FlockExclusiveNonBlocking(f); lockErr != nil {
-					// Lock is actively held by another process
-					warnings = append(warnings,
-						fmt.Sprintf("noms LOCK at dolt/%s/.dolt/noms/LOCK is held by another process — may block database access", dbEntry.Name()))
-				} else {
-					// File exists but lock is not held — stale file, not a problem
-					_ = lockfile.FlockUnlock(f)
-				}
-				_ = f.Close()
-			}
-		}
-	}
-
-	// Probe advisory lock to check if it's currently held
-	accessLockPath := filepath.Join(beadsDir, "dolt-access.lock")
-	if _, err := os.Stat(accessLockPath); err == nil {
-		f, err := os.OpenFile(accessLockPath, os.O_RDWR, 0) //nolint:gosec // controlled path
-		if err == nil {
-			if lockErr := lockfile.FlockExclusiveNonBlocking(f); lockErr != nil {
-				// Lock is held by another process
-				warnings = append(warnings,
-					"advisory lock is currently held by another bd process")
-			} else {
-				// We acquired it, meaning no one holds it — release immediately
-				_ = lockfile.FlockUnlock(f)
-			}
-			_ = f.Close()
-		}
-	}
-
-	if len(warnings) == 0 {
-		return DoctorCheck{
-			Name:     "Dolt Lock Health",
-			Status:   StatusOK,
-			Message:  "No lock contention detected",
-			Category: CategoryRuntime,
-		}
-	}
-
-	return DoctorCheck{
-		Name:     "Dolt Lock Health",
-		Status:   StatusWarning,
-		Message:  fmt.Sprintf("%d lock issue(s) detected", len(warnings)),
-		Detail:   strings.Join(warnings, "; "),
-		Fix:      "Run 'bd doctor --fix' to clean stale lock files, or wait for the other process to finish",
-		Category: CategoryRuntime,
-	}
 }
 
 // checkPhantomDatabases detects phantom catalog entries from naming convention
@@ -748,6 +741,51 @@ func checkSharedServerHealth(beadsDir string) DoctorCheck {
 		Status:   StatusOK,
 		Message:  fmt.Sprintf("Running (PID %d, port %d), database: %s", state.PID, state.Port, dbName),
 		Detail:   fmt.Sprintf("Server directory: %s", sharedDir),
+		Category: CategoryRuntime,
+	}
+}
+
+// CheckCorruptManifest reports the GH#3290 corrupt-manifest condition: the
+// dolt server log tail shows "root hash doesn't exist" and the affected
+// databases hold no recoverable data (empty journal, empty oldgen). The
+// repair (backup + reinitialize) is destructive, so it only runs via
+// bd doctor --fix with explicit confirmation — never automatically
+// (bd-6dnrw.6).
+func CheckCorruptManifest(path string) DoctorCheck {
+	beadsDir := ResolveBeadsDirForRepo(path)
+	if !IsDoltBackend(beadsDir) {
+		return DoctorCheck{
+			Name:     "Corrupt Manifest",
+			Status:   StatusOK,
+			Message:  "N/A (not using Dolt backend)",
+			Category: CategoryRuntime,
+		}
+	}
+
+	dirs, err := doltserver.DetectCorruptManifest(beadsDir)
+	if err != nil {
+		return DoctorCheck{
+			Name:     "Corrupt Manifest",
+			Status:   StatusWarning,
+			Message:  "Could not scan for corrupt-manifest state",
+			Detail:   err.Error(),
+			Category: CategoryRuntime,
+		}
+	}
+	if len(dirs) == 0 {
+		return DoctorCheck{
+			Name:     "Corrupt Manifest",
+			Status:   StatusOK,
+			Message:  "No corrupt-manifest state detected",
+			Category: CategoryRuntime,
+		}
+	}
+	return DoctorCheck{
+		Name:     "Corrupt Manifest",
+		Status:   StatusError,
+		Message:  fmt.Sprintf("%d dolt database(s) have a corrupt manifest with no recoverable data (GH#3290)", len(dirs)),
+		Detail:   strings.Join(dirs, "\n"),
+		Fix:      "Run 'bd doctor --fix' to back up the corrupt database(s) and reinitialize",
 		Category: CategoryRuntime,
 	}
 }

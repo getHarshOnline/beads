@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/steveyegge/beads/internal/templates/agents"
 )
 
 const (
@@ -35,7 +37,7 @@ if [ "${MUX_TOOL:-}" = "file_edit_replace_string" ] || [ "${MUX_TOOL:-}" = "file
   if command -v bd >/dev/null 2>&1; then
     bd dolt push >/dev/null 2>&1 || true
   elif [ -x "$HOME/bin/bd" ]; then
-    "$HOME/bin/bd" sync >/dev/null 2>&1 || true
+    "$HOME/bin/bd" dolt push >/dev/null 2>&1 || true
   fi
 fi
 ` + muxHookMarkerEnd + `
@@ -54,6 +56,7 @@ var (
 		setupCommand: "bd setup mux",
 		readHint:     "Mux reads AGENTS.md in workspace and global contexts. Restart the workspace session if it is already running.",
 		docsURL:      muxAgentInstructionsURL,
+		profile:      agents.ProfileFull,
 	}
 
 	muxProjectIntegration = agentsIntegration{
@@ -61,6 +64,7 @@ var (
 		setupCommand: "bd setup mux --project",
 		readHint:     "Mux also supports layered workspace instructions via .mux/AGENTS.md.",
 		docsURL:      muxAgentInstructionsURL,
+		profile:      agents.ProfileFull,
 	}
 
 	muxGlobalIntegration = agentsIntegration{
@@ -68,6 +72,7 @@ var (
 		setupCommand: "bd setup mux --global",
 		readHint:     "Mux global defaults can be stored in ~/.mux/AGENTS.md.",
 		docsURL:      muxAgentInstructionsURL,
+		profile:      agents.ProfileFull,
 	}
 
 	muxEnvProvider     = defaultAgentsEnv
@@ -199,19 +204,21 @@ func removeMuxProjectHooks(env agentsEnv) error {
 // InstallMux installs Mux integration.
 // When project=true, it also installs .mux/AGENTS.md.
 // When global=true, it also installs ~/.mux/AGENTS.md.
-func InstallMux(project bool, global bool) {
-	env := muxEnvProvider()
-	if err := installMux(env, project, global); err != nil {
-		setupExit(1)
-	}
+func InstallMux(project bool, global bool) error {
+	return installMux(muxEnvProvider(), project, global)
 }
 
 func installMux(env agentsEnv, project bool, global bool) error {
+	rootSkipped := false
+	env.skipped = &rootSkipped
 	if err := installAgents(env, muxIntegration); err != nil {
 		return err
 	}
 	if err := installMuxProjectHooks(env); err != nil {
 		return err
+	}
+	if rootSkipped {
+		_, _ = fmt.Fprintf(env.stdout, "✓ Mux hooks installed; managed section skipped for symlinked %s\n", env.agentsPath)
 	}
 
 	if project {
@@ -222,8 +229,13 @@ func installMux(env agentsEnv, project bool, global bool) error {
 
 		projectEnv := env
 		projectEnv.agentsPath = projectPath
+		projectSkipped := false
+		projectEnv.skipped = &projectSkipped
 		if err := installAgents(projectEnv, muxProjectIntegration); err != nil {
 			return err
+		}
+		if projectSkipped {
+			_, _ = fmt.Fprintf(env.stdout, "✓ Mux project hooks installed; managed section skipped for symlinked %s\n", projectPath)
 		}
 	}
 
@@ -241,17 +253,22 @@ func installMux(env agentsEnv, project bool, global bool) error {
 
 	globalEnv := env
 	globalEnv.agentsPath = globalPath
-	return installAgents(globalEnv, muxGlobalIntegration)
+	globalSkipped := false
+	globalEnv.skipped = &globalSkipped
+	if err := installAgents(globalEnv, muxGlobalIntegration); err != nil {
+		return err
+	}
+	if globalSkipped {
+		_, _ = fmt.Fprintf(env.stdout, "✓ Mux global setup completed; managed section skipped for symlinked %s\n", globalPath)
+	}
+	return nil
 }
 
 // CheckMux checks if Mux integration is installed.
 // When project=true, it also verifies .mux/AGENTS.md.
 // When global=true, it also verifies ~/.mux/AGENTS.md.
-func CheckMux(project bool, global bool) {
-	env := muxEnvProvider()
-	if err := checkMux(env, project, global); err != nil {
-		setupExit(1)
-	}
+func CheckMux(project bool, global bool) error {
+	return checkMux(muxEnvProvider(), project, global)
 }
 
 func checkMux(env agentsEnv, project bool, global bool) error {
@@ -286,11 +303,8 @@ func checkMux(env agentsEnv, project bool, global bool) error {
 // RemoveMux removes Mux integration.
 // When project=true, it also removes section from .mux/AGENTS.md.
 // When global=true, it also removes section from ~/.mux/AGENTS.md.
-func RemoveMux(project bool, global bool) {
-	env := muxEnvProvider()
-	if err := removeMux(env, project, global); err != nil {
-		setupExit(1)
-	}
+func RemoveMux(project bool, global bool) error {
+	return removeMux(muxEnvProvider(), project, global)
 }
 
 func removeMux(env agentsEnv, project bool, global bool) error {

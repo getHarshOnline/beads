@@ -54,12 +54,23 @@ func ValidateTemplate(issueType types.IssueType, description string) error {
 		headingText = strings.TrimPrefix(headingText, "# ")
 		headingLower := strings.ToLower(headingText)
 
-		if !strings.Contains(descLower, headingLower) {
-			missing = append(missing, MissingSection{
-				Heading: section.Heading,
-				Hint:    section.Hint,
-			})
+		if strings.Contains(descLower, headingLower) {
+			continue
 		}
+
+		// Epics canonically require "Success Criteria", but "Acceptance Criteria"
+		// is equally acceptable so epics aren't a special case agents have to
+		// remember (GH#3834). Success Criteria remains canonical for new epics
+		// (see RequiredSections); this only widens what bd lint accepts.
+		if issueType == types.TypeEpic && headingLower == "success criteria" &&
+			strings.Contains(descLower, "acceptance criteria") {
+			continue
+		}
+
+		missing = append(missing, MissingSection{
+			Heading: section.Heading,
+			Hint:    section.Hint,
+		})
 	}
 
 	if len(missing) > 0 {
@@ -109,4 +120,17 @@ func LintIssue(issue *types.Issue) error {
 	}
 	templateErr.Missing = remaining
 	return templateErr
+}
+
+// ValidateCloseReason checks if a close reason meets minimum quality standards.
+// Returns nil if the reason is acceptable. Used by validation.on-close config.
+func ValidateCloseReason(reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" || strings.EqualFold(reason, "closed") {
+		return fmt.Errorf("close reason is empty or default; provide a summary of what was done")
+	}
+	if len(reason) < 20 {
+		return fmt.Errorf("close reason is terse (%d chars); aim for 20+ characters describing what was done", len(reason))
+	}
+	return nil
 }

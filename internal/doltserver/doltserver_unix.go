@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // portConflictHint is the platform-specific command to diagnose port conflicts.
@@ -21,11 +22,9 @@ const portConflictHint = "lsof -i :%d"
 // Used in error messages when too many dolt servers are running.
 const processListHint = "pgrep -la 'dolt sql-server'"
 
-// procAttrDetached returns SysProcAttr to detach a child process from the parent
-// process group so it survives parent exit.
-func procAttrDetached() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{Setpgid: true}
-}
+// procAttrDetached is defined per-platform in procattr_linux.go (Linux) and
+// procattr_other_unix.go (darwin/BSD): Pdeathsig, used to test-gate
+// parent-death cleanup, exists only on Linux (see those files for details).
 
 // findPIDOnPort returns the PID of the process listening on a TCP port.
 // Uses lsof to look up the listener. Returns 0 if no process found or on error.
@@ -47,43 +46,67 @@ func findPIDOnPort(port int) int {
 // Excludes zombies and defunct processes. Callers derive count (len) and
 // membership (linear scan) from the returned slice.
 func listDoltProcessPIDs() []int {
-	out, err := exec.Command("pgrep", "-f", "dolt sql-server").Output()
+	out, err := exec.Command("ps", "-axo", "pid=,state=,command=").Output()
 	if err != nil {
 		return nil
 	}
+	return parseDoltProcessPIDs(out)
+}
+
+// parseDoltProcessPIDs returns matching, non-defunct Dolt server PIDs from a
+// `ps -axo pid=,state=,command=` snapshot. It preserves the source row order.
+func parseDoltProcessPIDs(snapshot []byte) []int {
 	var pids []int
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		pid, err := strconv.Atoi(strings.TrimSpace(line))
+	for _, line := range strings.Split(string(snapshot), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		pidText, rest, ok := splitPSField(line)
+		if !ok {
+			continue
+		}
+		state, command, ok := splitPSField(rest)
+		if !ok {
+			continue
+		}
+
+		pid, err := strconv.Atoi(pidText)
 		if err != nil || pid <= 0 {
 			continue
 		}
-		// Exclude zombies: ps -o state= returns Z for zombie, X for dead
-		stateOut, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "state=").Output()
-		if err != nil {
+		if state[0] == 'Z' || state[0] == 'X' {
 			continue
 		}
-		state := strings.TrimSpace(string(stateOut))
-		if len(state) > 0 && (state[0] == 'Z' || state[0] == 'X') {
-			continue
-		}
-		// Verify command line contains both "dolt" and "sql-server"
-		cmdOut, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
-		if err != nil {
-			continue
-		}
-		cmdline := strings.TrimSpace(string(cmdOut))
-		if strings.Contains(cmdline, "dolt") && strings.Contains(cmdline, "sql-server") {
+
+		doltIndex := strings.Index(command, "dolt")
+		if doltIndex >= 0 && strings.Contains(command[doltIndex+len("dolt"):], "sql-server") {
 			pids = append(pids, pid)
 		}
 	}
 	return pids
 }
 
+// splitPSField separates the next whitespace-delimited ps field from the
+// remaining text, retaining whitespace within the final command column.
+func splitPSField(line string) (field, rest string, ok bool) {
+	fieldEnd := strings.IndexFunc(line, unicode.IsSpace)
+	if fieldEnd == -1 {
+		return "", "", false
+	}
+	field = line[:fieldEnd]
+	rest = strings.TrimLeftFunc(line[fieldEnd:], unicode.IsSpace)
+	return field, rest, rest != ""
+}
+
 // isProcessInDir checks if a process's working directory matches the given path.
 // Uses lsof to look up the CWD, which is more reliable than checking command-line
 // args since dolt sql-server is started with cmd.Dir (not a --data-dir flag).
 func isProcessInDir(pid int, dir string) bool {
-	out, err := exec.Command("lsof", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
+	// On macOS, lsof requires -a to AND selectors together; without it,
+	// "-p <pid>" and "-d cwd" can yield cwd entries from unrelated processes.
+	out, err := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
 	if err != nil {
 		return false
 	}

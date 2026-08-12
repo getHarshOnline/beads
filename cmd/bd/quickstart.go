@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
@@ -13,16 +14,26 @@ var quickstartCmd = &cobra.Command{
 	Short:   "Quick start guide for bd",
 	Long:    `Display a quick start guide showing common bd workflows and patterns.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		evt := metrics.NewCommandEvent("quickstart")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		fmt.Printf("\n%s\n\n", ui.RenderBold("bd - Dependency-Aware Issue Tracker"))
 		fmt.Printf("Issues chained together like beads.\n\n")
 
 		fmt.Printf("%s\n", ui.RenderBold("GETTING STARTED"))
-		fmt.Printf("  %s   Initialize bd in your project\n", ui.RenderAccent("bd init"))
-		fmt.Printf("            Creates .beads/ directory with project-specific database\n")
+		fmt.Printf("  %s   Initialize bd in your project (embedded Dolt, no server needed)\n", ui.RenderAccent("bd init"))
+		fmt.Printf("            Creates .beads/ directory with project-specific Dolt database\n")
 		fmt.Printf("            Auto-detects prefix from directory name (e.g., myapp-1, myapp-2)\n\n")
 
 		fmt.Printf("  %s   Initialize with custom prefix\n", ui.RenderAccent("bd init --prefix api"))
 		fmt.Printf("            Issues will be named: api-<hash> (e.g., api-a3f2dd)\n\n")
+
+		fmt.Printf("  %s   Initialize with external Dolt server (multi-writer)\n", ui.RenderAccent("bd init --server"))
+		fmt.Printf("            Connects to a running dolt sql-server for concurrent access\n\n")
 
 		fmt.Printf("%s\n", ui.RenderBold("CREATING ISSUES"))
 		fmt.Printf("  %s\n", ui.RenderAccent("bd create \"Fix login bug\""))
@@ -60,32 +71,27 @@ var quickstartCmd = &cobra.Command{
 		fmt.Printf("  %s\n", ui.RenderAccent("bd close bd-1"))
 		fmt.Printf("  %s\n\n", ui.RenderAccent("bd close bd-2 bd-3 --reason \"Fixed in PR #42\""))
 
-		fmt.Printf("%s\n", ui.RenderBold("DATABASE LOCATION"))
-		fmt.Printf("  bd automatically discovers your database:\n")
-		fmt.Printf("    1. %s flag\n", ui.RenderAccent("--db /path/to/db.db"))
-		fmt.Printf("    2. %s environment variable\n", ui.RenderAccent("$BEADS_DB"))
-		fmt.Printf("    3. %s in current directory or ancestors\n", ui.RenderAccent(".beads/*.db"))
-		fmt.Printf("    4. %s as fallback\n\n", ui.RenderAccent("~/.beads/default.db"))
+		fmt.Printf("%s\n", ui.RenderBold("STORAGE"))
+		fmt.Printf("  bd uses Dolt, a version-controlled SQL database:\n")
+		fmt.Printf("    %s  Embedded mode (default): in-process, zero config\n", ui.RenderPass("●"))
+		fmt.Printf("              Data stored in %s\n", ui.RenderAccent(".beads/embeddeddolt/"))
+		fmt.Printf("    %s  Server mode (%s): multi-writer via dolt sql-server\n", ui.RenderPass("●"), ui.RenderAccent("bd init --server"))
+		fmt.Printf("              Data managed by external server\n\n")
+
+		fmt.Printf("%s\n", ui.RenderBold("SYNC"))
+		fmt.Printf("  Share issues with your team using Dolt remotes:\n")
+		fmt.Printf("    %s  Verify remote (bd init auto-wires git origin when present)\n", ui.RenderAccent("bd dolt remote list"))
+		fmt.Printf("    %s  Add remote if needed\n", ui.RenderAccent("bd dolt remote add origin git+ssh://git@github.com/org/repo.git"))
+		fmt.Printf("    %s              Push issues\n", ui.RenderAccent("bd dolt push"))
+		fmt.Printf("    %s              Pull from teammates\n", ui.RenderAccent("bd dolt pull"))
+		fmt.Printf("  Dolt handles sync natively with cell-level merge; JSONL is export, not sync\n\n")
 
 		fmt.Printf("%s\n", ui.RenderBold("AGENT INTEGRATION"))
 		fmt.Printf("  bd is designed for AI-supervised workflows:\n")
-		fmt.Printf("    • Agents create issues when discovering new work\n")
-		fmt.Printf("    • %s shows unblocked work ready to claim\n", ui.RenderAccent("bd ready"))
-		fmt.Printf("    • Use %s flags for programmatic parsing\n", ui.RenderAccent("--json"))
-		fmt.Printf("    • Dependencies prevent agents from duplicating effort\n\n")
-
-		fmt.Printf("%s\n", ui.RenderBold("DATABASE EXTENSION"))
-		fmt.Printf("  Applications can extend bd's SQLite database:\n")
-		fmt.Printf("    • Add your own tables (e.g., %s)\n", ui.RenderAccent("myapp_executions"))
-		fmt.Printf("    • Join with %s table for powerful queries\n", ui.RenderAccent("issues"))
-		fmt.Printf("    • See database extension docs for integration patterns:\n")
-		fmt.Printf("      %s\n\n", ui.RenderAccent("https://github.com/steveyegge/beads/blob/main/docs/EXTENDING.md"))
-
-		fmt.Printf("%s\n", ui.RenderBold("GIT WORKFLOW (AUTO-SYNC)"))
-		fmt.Printf("  bd automatically keeps git in sync:\n")
-		fmt.Printf("    • %s Database synced automatically via Dolt\n", ui.RenderPass("✓"))
-		fmt.Printf("    • %s Works seamlessly across machines and team members\n", ui.RenderPass("✓"))
-		fmt.Printf("  Dolt handles sync natively — no manual export/import needed\n\n")
+		fmt.Printf("    %s Agents create issues when discovering new work\n", ui.RenderPass("●"))
+		fmt.Printf("    %s %s shows unblocked work ready to claim\n", ui.RenderPass("●"), ui.RenderAccent("bd ready"))
+		fmt.Printf("    %s Use %s flags for programmatic parsing\n", ui.RenderPass("●"), ui.RenderAccent("--json"))
+		fmt.Printf("    %s Dependencies prevent agents from duplicating effort\n\n", ui.RenderPass("●"))
 
 		fmt.Printf("%s\n", ui.RenderPass("Ready to start!"))
 		fmt.Printf("Run %s to create your first issue.\n\n", ui.RenderAccent("bd create \"My first issue\""))

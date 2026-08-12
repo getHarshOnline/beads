@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,6 +19,8 @@ var testServerPort int
 
 func TestMain(m *testing.M) {
 	os.Setenv("BEADS_TEST_MODE", "1")
+	// AD-01 (be-c5p): allow root tests to connect to the test container.
+	os.Setenv("BEADS_TEST_SERVER", "1")
 	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
 		fmt.Fprintf(os.Stderr, "WARN: %v, skipping Dolt tests\n", err)
 	} else {
@@ -36,9 +37,7 @@ func TestMain(m *testing.M) {
 
 func skipIfNoDolt(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("dolt"); err != nil {
-		t.Skip("Dolt not installed, skipping test")
-	}
+	testutil.RequireDoltBinary(t)
 }
 
 func skipIfNoDoltServer(t *testing.T) {
@@ -146,16 +145,13 @@ func TestOpenFromConfig_DefaultsToEmbedded(t *testing.T) {
 
 func TestOpenFromConfig_ServerModeFailsWithoutServer(t *testing.T) {
 	// Server mode should fail-fast when no server is listening.
-	// Temporarily unset BEADS_DOLT_PORT/BEADS_TEST_MODE so the config port
-	// isn't overridden by applyConfigDefaults to the test server.
-	if prev := os.Getenv("BEADS_DOLT_PORT"); prev != "" {
-		os.Unsetenv("BEADS_DOLT_PORT")
-		t.Cleanup(func() { os.Setenv("BEADS_DOLT_PORT", prev) })
-	}
-	if prev := os.Getenv("BEADS_TEST_MODE"); prev != "" {
-		os.Unsetenv("BEADS_TEST_MODE")
-		t.Cleanup(func() { os.Setenv("BEADS_TEST_MODE", prev) })
-	}
+	// Clear port env vars so the config port from metadata.json is used —
+	// BEADS_DOLT_SERVER_PORT takes priority over BEADS_DOLT_PORT in
+	// GetDoltServerPort, so both must be cleared. Keep BEADS_TEST_MODE=1
+	// so auto-start is suppressed and the connection uses the free port
+	// from metadata.json (which has nothing listening).
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
 
 	tmpDir := t.TempDir()
 	beadsDir := filepath.Join(tmpDir, ".beads")
@@ -208,6 +204,68 @@ func TestOpenFromConfig_NoMetadata(t *testing.T) {
 	}
 }
 
+func TestOpenBestAvailable_ServerMode(t *testing.T) {
+	skipIfNoDoltServer(t)
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("failed to create .beads dir: %v", err)
+	}
+
+	metadata := fmt.Sprintf(`{"backend":"dolt","database":"dolt","dolt_mode":"server","dolt_server_host":"127.0.0.1","dolt_server_port":%d}`, testServerPort)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
+		t.Fatalf("failed to write metadata.json: %v", err)
+	}
+
+	ctx := context.Background()
+	store, err := beads.OpenBestAvailable(ctx, beadsDir)
+	if err != nil {
+		t.Fatalf("OpenBestAvailable (server mode) failed: %v", err)
+	}
+	defer store.Close()
+
+	if store == nil {
+		t.Error("expected non-nil storage")
+	}
+}
+
+func TestOpenBestAvailable_ServerMode_FailsWithoutServer(t *testing.T) {
+	// OpenBestAvailable in server mode should propagate the fail-fast error.
+	// Clear port env vars (both BEADS_DOLT_SERVER_PORT and BEADS_DOLT_PORT)
+	// so the config port from metadata.json is used. Keep BEADS_TEST_MODE=1
+	// so auto-start is suppressed.
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_PORT", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("failed to create .beads dir: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to find free port: %v", err)
+	}
+	freePort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	metadata := fmt.Sprintf(`{"backend":"dolt","database":"dolt","dolt_mode":"server","dolt_server_host":"127.0.0.1","dolt_server_port":%d}`, freePort)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(metadata), 0644); err != nil {
+		t.Fatalf("failed to write metadata.json: %v", err)
+	}
+
+	ctx := context.Background()
+	_, openErr := beads.OpenBestAvailable(ctx, beadsDir)
+	if openErr == nil {
+		t.Fatal("OpenBestAvailable (server mode) should fail when no server is running")
+	}
+	if !strings.Contains(openErr.Error(), "unreachable") {
+		t.Errorf("expected 'unreachable' in error, got: %v", openErr)
+	}
+}
+
 func TestFindAllDatabases(t *testing.T) {
 	// This scans the file system, just verify it doesn't panic
 	dbs := beads.FindAllDatabases()
@@ -254,4 +312,81 @@ func TestConstants(t *testing.T) {
 	if beads.DepRelated != "related" {
 		t.Errorf("DepRelated = %q, want %q", beads.DepRelated, "related")
 	}
+}
+
+func TestPublicAPITypeAssertions(t *testing.T) {
+	skipIfNoDoltServer(t)
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test-dolt")
+
+	ctx := context.Background()
+	store, err := beads.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	defer store.Close()
+
+	t.Run("RemoteStore", func(t *testing.T) {
+		rs, ok := store.(beads.RemoteStore)
+		if !ok {
+			t.Fatal("store does not satisfy beads.RemoteStore")
+		}
+		// Verify a method is callable (no remotes configured, so empty list)
+		remotes, err := rs.ListRemotes(ctx)
+		if err != nil {
+			t.Fatalf("ListRemotes failed: %v", err)
+		}
+		_ = remotes
+	})
+
+	t.Run("SyncStore", func(t *testing.T) {
+		_, ok := store.(beads.SyncStore)
+		if !ok {
+			t.Fatal("store does not satisfy beads.SyncStore")
+		}
+	})
+
+	t.Run("VersionControlReader", func(t *testing.T) {
+		vcr, ok := store.(beads.VersionControlReader)
+		if !ok {
+			t.Fatal("store does not satisfy beads.VersionControlReader")
+		}
+
+		branch, err := vcr.CurrentBranch(ctx)
+		if err != nil {
+			t.Fatalf("CurrentBranch failed: %v", err)
+		}
+		if branch == "" {
+			t.Error("expected non-empty branch name")
+		}
+
+		commit, err := vcr.GetCurrentCommit(ctx)
+		if err != nil {
+			t.Fatalf("GetCurrentCommit failed: %v", err)
+		}
+		if commit == "" {
+			t.Error("expected non-empty commit hash")
+		}
+
+		exists, err := vcr.CommitExists(ctx, commit)
+		if err != nil {
+			t.Fatalf("CommitExists failed: %v", err)
+		}
+		if !exists {
+			t.Errorf("CommitExists(%s) = false, want true", commit)
+		}
+
+		status, err := vcr.Status(ctx)
+		if err != nil {
+			t.Fatalf("Status failed: %v", err)
+		}
+		_ = status
+
+		logs, err := vcr.Log(ctx, 5)
+		if err != nil {
+			t.Fatalf("Log failed: %v", err)
+		}
+		_ = logs
+	})
 }

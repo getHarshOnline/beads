@@ -1,5 +1,3 @@
-//go:build cgo
-
 package doctor
 
 import (
@@ -12,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/utils"
 )
@@ -54,17 +53,17 @@ func CheckMigrationReadiness(path string) (DoctorCheck, MigrationValidationResul
 		SchemaValid: true,
 	}
 
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	// Check if .beads exists
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
 		result.Ready = false
-		result.Errors = append(result.Errors, "No .beads directory found")
+		result.Errors = append(result.Errors, "No active beads workspace found")
 		return DoctorCheck{
 			Name:     "Migration Readiness",
 			Status:   StatusError,
-			Message:  "No beads installation found",
-			Fix:      "Run 'bd init' first to create a beads installation",
+			Message:  "No active beads workspace found",
+			Fix:      "Run 'bd where' to inspect the resolved workspace, or 'bd init' to create a beads installation",
 			Category: CategoryMaintenance,
 		}, result
 	}
@@ -147,7 +146,7 @@ func CheckMigrationReadiness(path string) (DoctorCheck, MigrationValidationResul
 		Status:   status,
 		Message:  message,
 		Detail:   strings.Join(result.Warnings, "\n"),
-		Fix:      "Run 'bd migrate dolt' to start migration",
+		Fix:      "Follow 'bd help init-safety' to reinitialize with Dolt, then import and verify this JSONL export",
 		Category: CategoryMaintenance,
 	}, result
 }
@@ -166,17 +165,17 @@ func CheckMigrationCompletion(path string) (DoctorCheck, MigrationValidationResu
 		SchemaValid: true,
 	}
 
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	// Check if .beads exists
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
 		result.Ready = false
 		result.DoltHealthy = false
-		result.Errors = append(result.Errors, "No .beads directory found")
+		result.Errors = append(result.Errors, "No active beads workspace found")
 		return DoctorCheck{
 			Name:     "Migration Completion",
 			Status:   StatusError,
-			Message:  "No beads installation found",
+			Message:  "No active beads workspace found",
 			Category: CategoryMaintenance,
 		}, result
 	}
@@ -194,7 +193,7 @@ func CheckMigrationCompletion(path string) (DoctorCheck, MigrationValidationResu
 			Status:   StatusError,
 			Message:  "Not using Dolt backend",
 			Detail:   fmt.Sprintf("Current backend: %s", result.Backend),
-			Fix:      "Run 'bd migrate dolt' to migrate to Dolt",
+			Fix:      "Follow 'bd help init-safety' to reinitialize with Dolt, then import and verify the issue export",
 			Category: CategoryMaintenance,
 		}, result
 	}
@@ -301,7 +300,7 @@ func CheckMigrationCompletion(path string) (DoctorCheck, MigrationValidationResu
 			Status:   StatusError,
 			Message:  fmt.Sprintf("Migration incomplete: %d error(s)", len(result.Errors)),
 			Detail:   strings.Join(result.Errors, "\n"),
-			Fix:      "Re-run 'bd migrate dolt' or check for data issues",
+			Fix:      "Check the export/import results; follow 'bd help init-safety' before reinitializing again",
 			Category: CategoryMaintenance,
 		}, result
 	}
@@ -324,7 +323,7 @@ func CheckMigrationCompletion(path string) (DoctorCheck, MigrationValidationResu
 
 // CheckDoltLocks checks if the Dolt database has any locks or uncommitted changes.
 func CheckDoltLocks(path string) DoctorCheck {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	// Only run for Dolt backend
 	if !IsDoltBackend(beadsDir) {
@@ -440,7 +439,7 @@ func validateJSONLForMigration(jsonlPath string) (int, int, map[string]bool, err
 
 // compareDoltWithJSONL compares Dolt database with JSONL IDs.
 // Returns IDs in JSONL but not in Dolt (sample first 100).
-func compareDoltWithJSONL(ctx context.Context, store *dolt.DoltStore, jsonlIDs map[string]bool) []string {
+func compareDoltWithJSONL(ctx context.Context, store storage.DoltStorage, jsonlIDs map[string]bool) []string {
 	ids := make([]string, 0, len(jsonlIDs))
 	for id := range jsonlIDs {
 		ids = append(ids, id)
@@ -498,28 +497,12 @@ func checkDoltLocks(beadsDir string) (bool, string, error) {
 	}
 	defer rows.Close()
 
-	var changes []string
-	for rows.Next() {
-		var tableName string
-		var staged bool
-		var status string
-		if err := rows.Scan(&tableName, &staged, &status); err != nil {
-			continue
-		}
-		// Skip wisp tables — they are ephemeral and expected to have
-		// uncommitted changes (covered by dolt_ignore).
-		if isWispTable(tableName) {
-			continue
-		}
-		mark := ""
-		if staged {
-			mark = " (staged)"
-		}
-		changes = append(changes, fmt.Sprintf("%s: %s%s", tableName, status, mark))
-	}
-	if err := rows.Err(); err != nil {
+	// Same filter as the "Dolt Status" check — see describeUncommittedTables.
+	scanned, err := scanDoltStatus(rows)
+	if err != nil {
 		return false, "", fmt.Errorf("row iteration error: %w", err)
 	}
+	changes := describeUncommittedTables(scanned)
 
 	if len(changes) > 0 {
 		return true, strings.Join(changes, ", "), nil
@@ -531,12 +514,16 @@ func checkDoltLocks(beadsDir string) (bool, string, error) {
 // categorizeDoltExtras finds issues in Dolt that aren't in JSONL and categorizes them
 // as either foreign-prefix (cross-rig contamination) or ephemeral (same-prefix).
 // Returns: foreignCount, foreignPrefixes map, ephemeralCount.
-func categorizeDoltExtras(ctx context.Context, store *dolt.DoltStore, jsonlIDs map[string]bool) (int, map[string]int, int) {
+func categorizeDoltExtras(ctx context.Context, store storage.DoltStorage, jsonlIDs map[string]bool) (int, map[string]int, int) {
 	// Get the configured prefix for this rig
 	localPrefix, _ := store.GetConfig(ctx, "issue_prefix") // Best effort: empty prefix means no prefix-based validation
 
 	// Query all issue IDs from Dolt
-	db := store.UnderlyingDB()
+	accessor, ok := storage.UnwrapStore(store).(storage.RawDBAccessor)
+	if !ok {
+		return 0, nil, 0
+	}
+	db := accessor.UnderlyingDB()
 	if db == nil {
 		return 0, nil, 0
 	}

@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
 )
 
 // doltDatabaseName returns the configured Dolt database name for the given beads directory.
@@ -36,8 +38,135 @@ func doltServerConfig(beadsDir, doltPath string) *dolt.Config {
 		cfg.ServerHost = bcfg.GetDoltServerHost()
 		cfg.ServerPort = doltserver.DefaultConfig(beadsDir).Port
 		cfg.ServerUser = bcfg.GetDoltServerUser()
+		cfg.ServerTLS = bcfg.GetDoltServerTLS()
+		cfg.ServerPassword = bcfg.GetDoltServerPasswordForPort(cfg.ServerPort)
 	}
+	dolt.ApplyCLIAutoStart(beadsDir, cfg)
 	return cfg
+}
+
+// CheckLegacyCLIRemotes warns when legacy filesystem CLI remotes are not
+// represented in SQL, because bd now treats SQL remotes as the source of truth.
+func CheckLegacyCLIRemotes(path string) DoctorCheck {
+	backend, beadsDir := getBackendAndBeadsDir(path)
+	if backend != configfile.BackendDolt {
+		return DoctorCheck{
+			Name:     "Dolt Remote Migration",
+			Status:   StatusOK,
+			Message:  "N/A (non-Dolt backend)",
+			Category: CategoryFederation,
+		}
+	}
+
+	doltPath := getDatabasePath(beadsDir)
+	if _, err := os.Stat(doltPath); os.IsNotExist(err) {
+		return DoctorCheck{
+			Name:     "Dolt Remote Migration",
+			Status:   StatusOK,
+			Message:  "N/A (no dolt database)",
+			Category: CategoryFederation,
+		}
+	}
+
+	ctx := context.Background()
+	store, err := dolt.New(ctx, doltServerConfig(beadsDir, doltPath))
+	if err != nil {
+		return DoctorCheck{
+			Name:     "Dolt Remote Migration",
+			Status:   StatusOK,
+			Message:  "Skipped (database unavailable)",
+			Detail:   err.Error(),
+			Category: CategoryFederation,
+		}
+	}
+	defer func() { _ = store.Close() }()
+
+	sqlRemotes, err := store.ListRemotes(ctx)
+	if err != nil {
+		return DoctorCheck{
+			Name:     "Dolt Remote Migration",
+			Status:   StatusOK,
+			Message:  "Skipped (SQL remotes unavailable)",
+			Detail:   err.Error(),
+			Category: CategoryFederation,
+		}
+	}
+	sqlByName := make(map[string]string, len(sqlRemotes))
+	for _, remote := range sqlRemotes {
+		sqlByName[remote.Name] = remote.URL
+	}
+
+	type cliLocation struct {
+		label string
+		dir   string
+	}
+	locations := []cliLocation{
+		{label: "database CLI directory", dir: store.CLIDir()},
+		{label: "Dolt server root", dir: store.Path()},
+	}
+
+	var missing []string
+	var inspected []string
+	var inspectErrors []string
+	seenDirs := make(map[string]bool, len(locations))
+	for _, loc := range locations {
+		if loc.dir == "" {
+			continue
+		}
+		dir := filepath.Clean(loc.dir)
+		if seenDirs[dir] {
+			continue
+		}
+		seenDirs[dir] = true
+
+		if _, err := os.Stat(filepath.Join(dir, ".dolt")); err != nil {
+			if !os.IsNotExist(err) {
+				inspectErrors = append(inspectErrors, fmt.Sprintf("%s (%s): %v", loc.label, dir, err))
+			}
+			continue
+		}
+
+		cliRemotes, err := doltutil.ListCLIRemotes(dir)
+		if err != nil {
+			inspectErrors = append(inspectErrors, fmt.Sprintf("%s (%s): %v", loc.label, dir, err))
+			continue
+		}
+		inspected = append(inspected, fmt.Sprintf("%s: %s", loc.label, dir))
+		for _, remote := range cliRemotes {
+			sqlURL := sqlByName[remote.Name]
+			if !doltutil.RemoteURLsMatch(sqlURL, remote.URL) {
+				missing = append(missing, fmt.Sprintf("%s %s=%s", loc.label, remote.Name, remote.URL))
+			}
+		}
+	}
+
+	if len(inspected) == 0 && len(inspectErrors) > 0 {
+		return DoctorCheck{
+			Name:     "Dolt Remote Migration",
+			Status:   StatusOK,
+			Message:  "No legacy CLI remote check available",
+			Detail:   strings.Join(inspectErrors, "\n"),
+			Category: CategoryFederation,
+		}
+	}
+
+	if len(missing) == 0 {
+		return DoctorCheck{
+			Name:     "Dolt Remote Migration",
+			Status:   StatusOK,
+			Message:  "No legacy CLI-only remotes detected",
+			Category: CategoryFederation,
+		}
+	}
+
+	return DoctorCheck{
+		Name:     "Dolt Remote Migration",
+		Status:   StatusWarning,
+		Message:  fmt.Sprintf("%d legacy CLI remote(s) not visible through SQL", len(missing)),
+		Detail:   fmt.Sprintf("Inspected CLI directories:\n%s\nRemotes: %s\nbd dolt remote list, push, and pull use SQL remotes as the source of truth.", strings.Join(inspected, "\n"), strings.Join(missing, ", ")),
+		Fix:      "Re-register each remote with 'bd dolt remote add <name> <url>' so it is stored in SQL.",
+		Category: CategoryFederation,
+	}
 }
 
 // CheckFederationRemotesAPI checks if the remotesapi port is accessible for federation.
@@ -68,7 +197,7 @@ func CheckFederationRemotesAPI(path string) DoctorCheck {
 
 	// Check if dolt server is running using doltserver.IsRunning which
 	// correctly resolves PID file paths (in beadsDir, not doltPath)
-	// and handles Gas Town daemon PID files.
+	// and handles orchestrator daemon PID files.
 	serverState, _ := doltserver.IsRunning(beadsDir)
 	serverRunning := serverState != nil && serverState.Running
 
@@ -144,6 +273,9 @@ func CheckFederationRemotesAPI(path string) DoctorCheck {
 	host := "127.0.0.1"
 
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", remotesAPIPort))
+	// Left as a bare dial+close (no doltserver.ProbeSQLServer): remotesapi
+	// speaks gRPC/HTTP, not the MySQL protocol, so there is no handshake
+	// greeting to drain here.
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return DoctorCheck{
@@ -498,9 +630,7 @@ func CheckDoltServerModeMismatch(path string) DoctorCheck {
 		host := cfg.GetDoltServerHost()
 		port := doltserver.DefaultConfig(beadsDir).Port
 		addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-		if err == nil {
-			_ = conn.Close()
+		if _, err := doltserver.ProbeSQLServer("tcp", addr, 2*time.Second); err == nil {
 			serverReachable = true
 		}
 	}

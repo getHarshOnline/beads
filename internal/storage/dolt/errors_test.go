@@ -4,13 +4,43 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	mysql "github.com/go-sql-driver/mysql"
+
 	"github.com/steveyegge/beads/internal/storage"
 )
+
+func TestIsIndeterminateCommitResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "unexpected EOF", err: io.ErrUnexpectedEOF, want: true},
+		{name: "lost connection", err: errors.New("lost connection to MySQL server"), want: true},
+		{name: "packet protocol desync", err: mysql.ErrPktSync, want: true},
+		{name: "otherwise unproven untyped commit error", err: errors.New("commit rejected without typed response"), want: true},
+		{name: "typed semantic MySQL error", err: &mysql.MySQLError{Number: 1105, Message: "connection lost while validating commit"}, want: false},
+		{name: "typed rollback-guaranteed MySQL error", err: &mysql.MySQLError{Number: 1213, Message: "deadlock"}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isIndeterminateCommitResponse(tc.err); got != tc.want {
+				t.Errorf("isIndeterminateCommitResponse(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWrapSQLCommitError(t *testing.T) {
+	if err := wrapSQLCommitError("commit wisp", nil); err != nil {
+		t.Fatalf("wrapSQLCommitError(nil) = %v, want nil", err)
+	}
+}
 
 func TestWrapDBError(t *testing.T) {
 	t.Run("nil error returns nil", func(t *testing.T) {
@@ -100,15 +130,15 @@ func TestDatabaseNotFoundHint(t *testing.T) {
 		ServerPort: 3309,
 	}
 
-	t.Run("hint suggests setting sync.git-remote when empty", func(t *testing.T) {
-		cfg := baseCfg // SyncGitRemote is empty by default
+	t.Run("hint suggests setting sync.remote when empty", func(t *testing.T) {
+		cfg := baseCfg // SyncRemote is empty by default
 		err := databaseNotFoundError(&cfg)
 
 		msg := err.Error()
 
 		// FR-001: Must contain the setup hint (line-wrapped in output)
-		if !strings.Contains(msg, "set sync.git-remote") {
-			t.Errorf("expected hint to set sync.git-remote, got:\n%s", msg)
+		if !strings.Contains(msg, "set sync.remote") {
+			t.Errorf("expected hint to set sync.remote, got:\n%s", msg)
 		}
 		if !strings.Contains(msg, ".beads/config.yaml") {
 			t.Errorf("expected .beads/config.yaml reference, got:\n%s", msg)
@@ -122,31 +152,34 @@ func TestDatabaseNotFoundHint(t *testing.T) {
 			t.Errorf("expected server address in error, got:\n%s", msg)
 		}
 
-		// Must contain existing suggestions
-		if !strings.Contains(msg, "bd init") {
-			t.Errorf("expected bd init suggestion, got:\n%s", msg)
+		// Must contain recovery suggestions
+		if !strings.Contains(msg, "bd bootstrap") {
+			t.Errorf("expected bd bootstrap suggestion, got:\n%s", msg)
 		}
 		if !strings.Contains(msg, "bd doctor") {
 			t.Errorf("expected bd doctor suggestion, got:\n%s", msg)
 		}
+		if strings.Contains(msg, "re-run bd init") {
+			t.Errorf("did not expect init-first recovery guidance, got:\n%s", msg)
+		}
 	})
 
-	t.Run("hint mentions configured sync.git-remote when set", func(t *testing.T) {
+	t.Run("hint mentions configured sync.remote when set", func(t *testing.T) {
 		cfg := baseCfg
-		cfg.SyncGitRemote = "https://doltremoteapi.dolthub.com/myorg/beads"
+		cfg.SyncRemote = "https://doltremoteapi.dolthub.com/myorg/beads"
 		err := databaseNotFoundError(&cfg)
 
 		msg := err.Error()
 
 		// FR-002: Must mention it's configured and show the URL
-		if !strings.Contains(msg, "sync.git-remote is configured") {
+		if !strings.Contains(msg, "sync.remote is configured") {
 			t.Errorf("expected configured hint, got:\n%s", msg)
 		}
 		if !strings.Contains(msg, "https://doltremoteapi.dolthub.com/myorg/beads") {
 			t.Errorf("expected remote URL in hint, got:\n%s", msg)
 		}
-		if !strings.Contains(msg, "bd init") {
-			t.Errorf("expected bd init suggestion, got:\n%s", msg)
+		if !strings.Contains(msg, "bd bootstrap") {
+			t.Errorf("expected bd bootstrap suggestion, got:\n%s", msg)
 		}
 	})
 
@@ -171,6 +204,9 @@ func TestDatabaseNotFoundHint(t *testing.T) {
 		}
 		if !strings.Contains(msg, "bd backup restore") {
 			t.Errorf("expected bd backup restore suggestion, got:\n%s", msg)
+		}
+		if !strings.Contains(msg, "bd bootstrap") {
+			t.Errorf("expected bd bootstrap suggestion, got:\n%s", msg)
 		}
 		// Should still mention branch switching as a common cause
 		if !strings.Contains(msg, "branch") {
@@ -242,4 +278,53 @@ func TestHasBackupFiles(t *testing.T) {
 			t.Error("expected true when jsonl files present")
 		}
 	})
+}
+
+func TestIsBranchTrackingError(t *testing.T) {
+	t.Parallel()
+
+	t.Run("matches dolt branch tracking error", func(t *testing.T) {
+		err := fmt.Errorf("Error 1105: You asked to pull from the remote 'origin', but did not specify a branch. Because this is not the default configured remote for your current branch, you must specify a branch.")
+		if !isBranchTrackingError(err) {
+			t.Error("expected true for branch tracking error")
+		}
+	})
+
+	t.Run("does not match unrelated errors", func(t *testing.T) {
+		if isBranchTrackingError(fmt.Errorf("connection refused")) {
+			t.Error("expected false for connection error")
+		}
+	})
+
+	t.Run("nil error returns false", func(t *testing.T) {
+		if isBranchTrackingError(nil) {
+			t.Error("expected false for nil error")
+		}
+	})
+}
+
+func TestIsDoltAutocommitRollbackError(t *testing.T) {
+	exact := &mysql.MySQLError{
+		Number:  1105,
+		Message: "Merge conflict detected, @autocommit transaction rolled back",
+	}
+
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "exact typed Dolt rollback", err: fmt.Errorf("dolt commit: %w", exact), want: true},
+		{name: "typed Dolt rollback with recovery guidance", err: &mysql.MySQLError{Number: 1105, Message: exact.Message + ". @autocommit must be disabled"}, want: true},
+		{name: "untyped matching text", err: errors.New(exact.Error()), want: false},
+		{name: "other typed 1105", err: &mysql.MySQLError{Number: 1105, Message: "Merge conflict detected"}, want: false},
+		{name: "typed connection-like 1105", err: &mysql.MySQLError{Number: 1105, Message: "connection lost while validating commit"}, want: false},
+		{name: "same text wrong code", err: &mysql.MySQLError{Number: 1213, Message: exact.Message}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isDoltAutocommitRollbackError(tc.err); got != tc.want {
+				t.Errorf("isDoltAutocommitRollbackError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
 }

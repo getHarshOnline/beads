@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/beads/internal/storage/dolt"
+	storageissueops "github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -463,6 +466,14 @@ func TestDepAddFlagAliases(t *testing.T) {
 	if !strings.Contains(longDesc, "--depends-on") {
 		t.Error("Expected Long description to mention --depends-on flag")
 	}
+	if fileFlag := depAddCmd.Flags().Lookup("file"); fileFlag == nil {
+		t.Fatal("depAddCmd should have --file flag")
+	} else if fileFlag.DefValue != "" {
+		t.Errorf("Expected default file='', got %q", fileFlag.DefValue)
+	}
+	if !strings.Contains(longDesc, "--file") {
+		t.Error("Expected Long description to mention --file flag")
+	}
 }
 
 func TestDepBlocksFlag(t *testing.T) {
@@ -734,92 +745,6 @@ func TestDepTreeStatusFlag(t *testing.T) {
 	}
 }
 
-func TestFilterTreeByStatus(t *testing.T) {
-	tree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "BD-1", Title: "Parent", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "BD-2", Title: "Open Child", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "BD-1",
-		},
-		{
-			Issue:    types.Issue{ID: "BD-3", Title: "Closed Child", Status: types.StatusClosed},
-			Depth:    1,
-			ParentID: "BD-1",
-		},
-		{
-			Issue:    types.Issue{ID: "BD-4", Title: "Open Grandchild", Status: types.StatusOpen},
-			Depth:    2,
-			ParentID: "BD-3",
-		},
-	}
-
-	t.Run("filter to open only", func(t *testing.T) {
-		filtered := filterTreeByStatus(tree, types.StatusOpen)
-
-		// Should include BD-1, BD-2, and BD-4 (matching)
-		// Plus BD-3 as ancestor of BD-4
-		ids := make(map[string]bool)
-		for _, node := range filtered {
-			ids[node.ID] = true
-		}
-
-		if !ids["BD-1"] {
-			t.Error("Expected BD-1 (root open) in filtered tree")
-		}
-		if !ids["BD-2"] {
-			t.Error("Expected BD-2 (open child) in filtered tree")
-		}
-		if !ids["BD-3"] {
-			t.Error("Expected BD-3 (ancestor of open node) in filtered tree")
-		}
-		if !ids["BD-4"] {
-			t.Error("Expected BD-4 (open grandchild) in filtered tree")
-		}
-	})
-
-	t.Run("filter to closed only", func(t *testing.T) {
-		filtered := filterTreeByStatus(tree, types.StatusClosed)
-
-		ids := make(map[string]bool)
-		for _, node := range filtered {
-			ids[node.ID] = true
-		}
-
-		// Should include BD-3 (matching) and BD-1 (ancestor)
-		if !ids["BD-1"] {
-			t.Error("Expected BD-1 (ancestor) in filtered tree")
-		}
-		if !ids["BD-3"] {
-			t.Error("Expected BD-3 (closed) in filtered tree")
-		}
-		if ids["BD-2"] {
-			t.Error("BD-2 should not be in closed-filtered tree")
-		}
-		if ids["BD-4"] {
-			t.Error("BD-4 should not be in closed-filtered tree")
-		}
-	})
-
-	t.Run("filter to non-existent status", func(t *testing.T) {
-		filtered := filterTreeByStatus(tree, types.StatusBlocked)
-		if len(filtered) != 0 {
-			t.Errorf("Expected empty tree when filtering to non-matching status, got %d nodes", len(filtered))
-		}
-	})
-
-	t.Run("filter empty tree", func(t *testing.T) {
-		filtered := filterTreeByStatus([]*types.TreeNode{}, types.StatusOpen)
-		if len(filtered) != 0 {
-			t.Errorf("Expected empty tree, got %d nodes", len(filtered))
-		}
-	})
-}
-
 func TestFormatTreeNode(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -906,6 +831,59 @@ func TestFormatTreeNode(t *testing.T) {
 	})
 }
 
+func TestFormatTreeNodeShowsDependencyType(t *testing.T) {
+	tests := []struct {
+		name string
+		node *types.TreeNode
+		want string
+	}{
+		{
+			name: "blocks edge",
+			node: &types.TreeNode{
+				Issue:          types.Issue{ID: "BD-2", Title: "Blocked task", Status: types.StatusOpen, Priority: 1},
+				Depth:          1,
+				ParentID:       "BD-1",
+				EdgeFromParent: types.DepBlocks,
+			},
+			want: "[blocks]",
+		},
+		{
+			name: "parent-child edge",
+			node: &types.TreeNode{
+				Issue:          types.Issue{ID: "BD-3", Title: "Child task", Status: types.StatusOpen, Priority: 2},
+				Depth:          1,
+				ParentID:       "BD-1",
+				EdgeFromParent: types.DepParentChild,
+			},
+			want: "[parent-child]",
+		},
+		{
+			name: "root has no edge label",
+			node: &types.TreeNode{
+				Issue:          types.Issue{ID: "BD-1", Title: "Root", Status: types.StatusOpen, Priority: 0},
+				Depth:          0,
+				EdgeFromParent: types.DepBlocks,
+			},
+			want: "[blocks]",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatTreeNode(tt.node, false)
+			if tt.node.Depth == 0 {
+				if strings.Contains(got, tt.want) {
+					t.Fatalf("root node should not show dependency label %q: %s", tt.want, got)
+				}
+				return
+			}
+			if !strings.Contains(got, tt.want) {
+				t.Fatalf("formatTreeNode() = %q, want dependency label %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRenderTreeOutput(t *testing.T) {
 	// Test tree with proper connectors
 	tree := []*types.TreeNode{
@@ -958,260 +936,70 @@ func TestRenderTreeOutput(t *testing.T) {
 	}
 }
 
-func TestMergeBidirectionalTrees_Empty(t *testing.T) {
-	// Test merging empty trees
-	downTree := []*types.TreeNode{}
-	upTree := []*types.TreeNode{}
-	rootID := "test-root"
-
-	result := mergeBidirectionalTrees(downTree, upTree, rootID)
-
-	if len(result) != 0 {
-		t.Errorf("Expected empty result for empty trees, got %d nodes", len(result))
-	}
-}
-
-func TestMergeBidirectionalTrees_OnlyDown(t *testing.T) {
-	// Test with only down tree (dependencies)
+func TestRenderTreeOutputShowsDependencyTypeLabelsInMixedGraph(t *testing.T) {
 	downTree := []*types.TreeNode{
 		{
-			Issue:    types.Issue{ID: "test-root", Title: "Root", Status: types.StatusOpen},
+			Issue:    types.Issue{ID: "BD-root", Title: "Root", Status: types.StatusOpen, Priority: 1},
 			Depth:    0,
 			ParentID: "",
 		},
 		{
-			Issue:    types.Issue{ID: "dep-1", Title: "Dependency 1", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "test-root",
-		},
-		{
-			Issue:    types.Issue{ID: "dep-2", Title: "Dependency 2", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "test-root",
+			Issue:          types.Issue{ID: "BD-child", Title: "Child", Status: types.StatusOpen, Priority: 2},
+			Depth:          1,
+			ParentID:       "BD-root",
+			EdgeFromParent: types.DepParentChild,
 		},
 	}
 	upTree := []*types.TreeNode{
 		{
-			Issue:    types.Issue{ID: "test-root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-	}
-
-	result := mergeBidirectionalTrees(downTree, upTree, "test-root")
-
-	// Should have all nodes from down tree
-	if len(result) != 3 {
-		t.Errorf("Expected 3 nodes, got %d", len(result))
-	}
-
-	// Verify downTree nodes are present
-	hasRoot := false
-	hasDep1 := false
-	hasDep2 := false
-	for _, node := range result {
-		if node.ID == "test-root" {
-			hasRoot = true
-		}
-		if node.ID == "dep-1" {
-			hasDep1 = true
-		}
-		if node.ID == "dep-2" {
-			hasDep2 = true
-		}
-	}
-	if !hasRoot || !hasDep1 || !hasDep2 {
-		t.Error("Expected all down tree nodes in result")
-	}
-}
-
-func TestMergeBidirectionalTrees_WithDependents(t *testing.T) {
-	// Test with both dependencies and dependents
-	downTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "test-root", Title: "Root", Status: types.StatusOpen},
+			Issue:    types.Issue{ID: "BD-root", Title: "Root", Status: types.StatusOpen, Priority: 1},
 			Depth:    0,
 			ParentID: "",
 		},
 		{
-			Issue:    types.Issue{ID: "dep-1", Title: "Dependency 1", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "test-root",
+			Issue:          types.Issue{ID: "BD-dependent", Title: "Dependent", Status: types.StatusOpen, Priority: 3},
+			Depth:          1,
+			ParentID:       "BD-root",
+			EdgeFromParent: types.DepBlocks,
 		},
 	}
-	upTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "test-root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "dependent-1", Title: "Dependent 1", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "test-root",
-		},
-	}
+	tree := storageissueops.MergeBidirectionalTree(downTree, upTree, "BD-root")
 
-	result := mergeBidirectionalTrees(downTree, upTree, "test-root")
+	old := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
 
-	// Should have dependent first, then down tree nodes (3 total, root appears once)
-	// Pattern: dependent node(s), then root + dependencies
-	if len(result) < 3 {
-		t.Errorf("Expected at least 3 nodes, got %d", len(result))
-	}
+	renderTree(tree, 3, "both")
 
-	// Find dependent-1 and dep-1 in result
-	foundDependentID := false
-	foundDepID := false
-	for _, node := range result {
-		if node.ID == "dependent-1" {
-			foundDependentID = true
-		}
-		if node.ID == "dep-1" {
-			foundDepID = true
-		}
-	}
+	w.Close()
+	os.Stdout = old
 
-	if !foundDependentID {
-		t.Error("Expected dependent-1 in merged result")
-	}
-	if !foundDepID {
-		t.Error("Expected dep-1 in merged result")
-	}
-}
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	output := buf.String()
 
-func TestMergeBidirectionalTrees_MultipleDepth(t *testing.T) {
-	// Test with multi-level hierarchies
-	downTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "dep-1", Title: "Dep 1", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "root",
-		},
-		{
-			Issue:    types.Issue{ID: "dep-1-1", Title: "Dep 1.1", Status: types.StatusOpen},
-			Depth:    2,
-			ParentID: "dep-1",
-		},
-	}
-	upTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "dependent-1", Title: "Dependent 1", Status: types.StatusOpen},
-			Depth:    1,
-			ParentID: "root",
-		},
-		{
-			Issue:    types.Issue{ID: "dependent-1-1", Title: "Dependent 1.1", Status: types.StatusOpen},
-			Depth:    2,
-			ParentID: "dependent-1",
-		},
-	}
-
-	result := mergeBidirectionalTrees(downTree, upTree, "root")
-
-	// Should include all nodes from both trees (minus duplicate root)
-	if len(result) < 5 {
-		t.Errorf("Expected at least 5 nodes, got %d", len(result))
-	}
-
-	// Verify all IDs are present (except we might have root twice from both trees)
-	expectedIDs := map[string]bool{
-		"root":          false,
-		"dep-1":         false,
-		"dep-1-1":       false,
-		"dependent-1":   false,
-		"dependent-1-1": false,
-	}
-
-	for _, node := range result {
-		if _, exists := expectedIDs[node.ID]; exists {
-			expectedIDs[node.ID] = true
-		}
-	}
-
-	for id, found := range expectedIDs {
-		if !found {
-			t.Errorf("Expected ID %s in merged result", id)
+	for _, want := range []string{"BD-dependent", "[blocks]", "BD-child", "[parent-child]"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("expected mixed graph output to contain %q, got:\n%s", want, output)
 		}
 	}
 }
 
-func TestMergeBidirectionalTrees_ExcludesRootFromUp(t *testing.T) {
-	// Test that root is excluded from upTree
-	downTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-	}
-	upTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
+func TestTreeNodeJSONIncludesEdgeFromParent(t *testing.T) {
+	node := types.TreeNode{
+		Issue:          types.Issue{ID: "BD-child", Title: "Child", Status: types.StatusOpen, Priority: 2},
+		Depth:          1,
+		ParentID:       "BD-root",
+		EdgeFromParent: types.DepParentChild,
 	}
 
-	result := mergeBidirectionalTrees(downTree, upTree, "root")
-
-	// Should have exactly 1 node (root)
-	if len(result) != 1 {
-		t.Errorf("Expected 1 node (root only), got %d", len(result))
+	got, err := json.Marshal(node)
+	if err != nil {
+		t.Fatalf("json.Marshal(TreeNode): %v", err)
 	}
 
-	if result[0].ID != "root" {
-		t.Errorf("Expected root node, got %s", result[0].ID)
-	}
-}
-
-func TestMergeBidirectionalTrees_PreservesDepth(t *testing.T) {
-	// Test that depth values are preserved from original trees
-	downTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "dep-1", Title: "Dep 1", Status: types.StatusOpen},
-			Depth:    5, // Non-standard depth to verify preservation
-			ParentID: "root",
-		},
-	}
-	upTree := []*types.TreeNode{
-		{
-			Issue:    types.Issue{ID: "root", Title: "Root", Status: types.StatusOpen},
-			Depth:    0,
-			ParentID: "",
-		},
-		{
-			Issue:    types.Issue{ID: "dependent-1", Title: "Dependent 1", Status: types.StatusOpen},
-			Depth:    3, // Different depth
-			ParentID: "root",
-		},
-	}
-
-	result := mergeBidirectionalTrees(downTree, upTree, "root")
-
-	// Find nodes and verify their depths are preserved
-	for _, node := range result {
-		if node.ID == "dep-1" && node.Depth != 5 {
-			t.Errorf("Expected dep-1 depth=5, got %d", node.Depth)
-		}
-		if node.ID == "dependent-1" && node.Depth != 3 {
-			t.Errorf("Expected dependent-1 depth=3, got %d", node.Depth)
-		}
+	if !strings.Contains(string(got), `"edge_from_parent":"parent-child"`) {
+		t.Fatalf("TreeNode JSON missing edge_from_parent: %s", got)
 	}
 }
 
@@ -1320,6 +1108,101 @@ func TestIsChildOf(t *testing.T) {
 				t.Errorf("isChildOf(%q, %q) = %v, want %v", tt.childID, tt.parentID, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestDepRoutedTargetOpensReadOnly is the regression guard for the dep/link
+// target-resolution invariant: a cross-rig dependency target is resolved by ID
+// only, so resolveIDWithRouting must open the routed foreign store read-only,
+// while resolveIDForMutation (used for the mutated source issue) opens it
+// writable. Opening a dep/link target writable re-exposes GH#3231 open-time
+// mutations against a foreign project.
+//
+// NOTE: This test uses os.Chdir and cannot run in parallel with other tests.
+func TestDepRoutedTargetOpensReadOnly(t *testing.T) {
+	ctx := context.Background()
+
+	tmpDir := t.TempDir()
+	townBeadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(townBeadsDir, 0755); err != nil {
+		t.Fatalf("create town beads dir: %v", err)
+	}
+	rigBeadsDir := filepath.Join(tmpDir, "rig", ".beads")
+	if err := os.MkdirAll(rigBeadsDir, 0755); err != nil {
+		t.Fatalf("create rig beads dir: %v", err)
+	}
+
+	townDBPath := filepath.Join(townBeadsDir, "dolt")
+	townStore := newTestStoreIsolatedDB(t, townDBPath, "hq")
+
+	rigDBPath := filepath.Join(rigBeadsDir, "dolt")
+	rigStore := newTestStoreIsolatedDB(t, rigDBPath, "gt")
+	if err := rigStore.CreateIssue(ctx, &types.Issue{
+		ID:        "gt-target1",
+		Title:     "Routed dep target",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}, "test"); err != nil {
+		t.Fatalf("create rig issue: %v", err)
+	}
+	// Release the rig store before routing reopens it.
+	rigStore.Close()
+
+	routesPath := filepath.Join(townBeadsDir, "routes.jsonl")
+	if err := os.WriteFile(routesPath, []byte(`{"prefix":"gt-","path":"rig"}`), 0644); err != nil {
+		t.Fatalf("write routes.jsonl: %v", err)
+	}
+
+	oldDbPath := dbPath
+	dbPath = townDBPath
+	t.Cleanup(func() { dbPath = oldDbPath })
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	// Target-only resolution (the dep/link target) must open the routed store
+	// read-only.
+	roID, roStore, roCleanup, err := resolveIDWithRouting(ctx, townStore, "gt-target1")
+	if err != nil {
+		t.Fatalf("resolveIDWithRouting (target) failed: %v", err)
+	}
+	if roID != "gt-target1" {
+		t.Errorf("resolved target ID = %q, want gt-target1", roID)
+	}
+	roDolt, ok := roStore.(*dolt.DoltStore)
+	if !ok {
+		roCleanup()
+		t.Fatalf("routed target store is %T, want *dolt.DoltStore", roStore)
+	}
+	if !roDolt.IsReadOnly() {
+		roCleanup()
+		t.Fatal("dep/link target must be resolved read-only, but routed store is writable (GH#3231)")
+	}
+	roCleanup()
+
+	// Source resolution (the mutated issue's store) must open the routed store
+	// writable so the dependency write commits on the target head (#4141).
+	rwID, rwStore, rwCleanup, err := resolveIDForMutation(ctx, townStore, "gt-target1")
+	if err != nil {
+		t.Fatalf("resolveIDForMutation (source) failed: %v", err)
+	}
+	defer rwCleanup()
+	if rwID != "gt-target1" {
+		t.Errorf("resolved source ID = %q, want gt-target1", rwID)
+	}
+	rwDolt, ok := rwStore.(*dolt.DoltStore)
+	if !ok {
+		t.Fatalf("routed source store is %T, want *dolt.DoltStore", rwStore)
+	}
+	if rwDolt.IsReadOnly() {
+		t.Fatal("source resolution must open the routed store writable, but it is read-only")
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	mysql "github.com/go-sql-driver/mysql"
 
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dberrors"
 )
 
 // Sentinel errors for the dolt storage layer.
@@ -28,6 +29,24 @@ var (
 
 	// ErrExec indicates a database exec (INSERT/UPDATE/DELETE) failure.
 	ErrExec = errors.New("exec error")
+
+	// ErrDanglingReference indicates that the pre-push integrity check detected
+	// missing chunks in the local Dolt noms store. The push was aborted to
+	// prevent propagating the corruption to the remote. Run bd dolt verify
+	// to diagnose and recover.
+	ErrDanglingReference = errors.New("dangling chunk reference")
+
+	// ErrFSCKTimeout indicates that the pre-push integrity check (dolt fsck) did
+	// not complete within the configured timeout. The push was aborted without
+	// verifying chunk integrity — the store is not necessarily corrupt. Large
+	// stores can be shrunk with `dolt gc` (or `CALL DOLT_GC()` on a running
+	// sql-server); the timeout can be raised via the BEADS_FSCK_TIMEOUT
+	// environment variable.
+	ErrFSCKTimeout = errors.New("pre-push integrity check timed out")
+
+	// ErrCommitIndeterminate is the storage-wide no-replay sentinel. Keep this
+	// alias for server-Dolt callers while embedded Dolt returns the same value.
+	ErrCommitIndeterminate = storage.ErrCommitIndeterminate
 )
 
 // isTableNotExistError returns true if the error indicates a MySQL/Dolt
@@ -35,16 +54,64 @@ var (
 // fallthrough (pre-migration databases without wisps table) from real errors
 // (timeouts, connection failures, corrupt data).
 func isTableNotExistError(err error) bool {
-	var mysqlErr *mysql.MySQLError
-	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1146
+	return dberrors.IsTableNotExist(err)
+}
+
+// isBranchTrackingError returns true if the error indicates that DOLT_PULL
+// failed because upstream branch tracking is not configured. This happens
+// when a remote was added via DOLT_REMOTE('add') or bd dolt remote add
+// rather than via dolt clone / bd bootstrap, leaving repo_state.json with
+// an empty "branches" map (GH#3144).
+func isBranchTrackingError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "did not specify a branch")
 }
 
 // isSerializationError returns true if the error is a Dolt/MySQL serialization
-// failure (Error 1213). This occurs when concurrent transactions conflict at
-// commit time; the caller should retry the transaction.
+// failure that guarantees the transaction was rolled back. Safe to retry.
+//   - 1213 (ER_LOCK_DEADLOCK): concurrent transactions conflict at commit time
+//   - 1205 (ER_LOCK_WAIT_TIMEOUT): lock wait exceeded, transaction rolled back
 func isSerializationError(err error) bool {
 	var mysqlErr *mysql.MySQLError
-	return errors.As(err, &mysqlErr) && mysqlErr.Number == 1213
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == 1213 || mysqlErr.Number == 1205
+}
+
+// isDoltAutocommitRollbackError reports Dolt's explicit, rollback-guaranteed
+// commit conflict. A MySQL error is retried only when its decoded code and
+// server-provided semantic message identify this condition; newer Dolt builds
+// append recovery guidance after the same sentence.
+func isDoltAutocommitRollbackError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	return errors.As(err, &mysqlErr) &&
+		mysqlErr.Number == 1105 &&
+		(mysqlErr.Message == "Merge conflict detected, @autocommit transaction rolled back" ||
+			strings.HasPrefix(mysqlErr.Message, "Merge conflict detected, @autocommit transaction rolled back."))
+}
+
+// isIndeterminateCommitResponse reports whether a Commit error lacks a decoded
+// server response proving a definite rejection or rollback. Every untyped
+// protocol or transport error is conservatively indeterminate.
+func isIndeterminateCommitResponse(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrCommitIndeterminate) {
+		return true
+	}
+	var mysqlErr *mysql.MySQLError
+	return !errors.As(err, &mysqlErr)
+}
+
+func wrapSQLCommitError(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if isIndeterminateCommitResponse(err) {
+		return fmt.Errorf("%s: %w: %w", op, err, ErrCommitIndeterminate)
+	}
+	return fmt.Errorf("%s: %w", op, err)
 }
 
 // wrapDBError wraps a database error with operation context.
@@ -93,7 +160,7 @@ func wrapExecError(op string, err error) error {
 }
 
 // databaseNotFoundError builds the "database not found" error with a config-aware
-// hint about sync.git-remote and backup recovery. Extracted from openServerConnection
+// hint about sync.remote and backup recovery. Extracted from openServerConnection
 // for testability.
 func databaseNotFoundError(cfg *Config) error {
 	var b strings.Builder
@@ -104,9 +171,9 @@ func databaseNotFoundError(cfg *Config) error {
 	if HasBackupFiles(cfg.BeadsDir) {
 		b.WriteString("Backup files found in .beads/backup/ — this may be a branch-switch\n")
 		b.WriteString("or fresh-clone scenario where the Dolt database doesn't exist yet.\n\n")
-		b.WriteString("To restore your issues:\n")
-		b.WriteString("  bd init --prefix <prefix>    # Initialize the database\n")
-		b.WriteString("  bd backup restore            # Restore issues from backup\n\n")
+		b.WriteString("Use the safe entry point for existing-project recovery:\n")
+		b.WriteString("  bd bootstrap                 # Auto-detect remote/backup/JSONL recovery or initialization\n")
+		b.WriteString("  bd backup restore            # If backup recovery still needs manual restore\n\n")
 		b.WriteString("If this is NOT a branch switch, see common causes below.\n\n")
 	}
 
@@ -119,10 +186,13 @@ func databaseNotFoundError(cfg *Config) error {
 	b.WriteString("  bd doctor                  # Check server and database health\n")
 	b.WriteString("  bd dolt status             # Show which data directory the server is using")
 
-	if cfg.SyncGitRemote != "" {
-		fmt.Fprintf(&b, "\n\nTip: sync.git-remote is configured (%s).\nRun bd init to bootstrap from the remote.", cfg.SyncGitRemote)
+	if cfg.SyncRemote != "" {
+		fmt.Fprintf(&b, "\n\nTip: sync.remote is configured (%s).\nRun bd bootstrap to recover from the remote or confirm what bootstrap will do with --dry-run.", cfg.SyncRemote)
 	} else {
-		b.WriteString("\n\nTip: To bootstrap from an existing Dolt remote, set sync.git-remote\nin .beads/config.yaml and re-run bd init.")
+		b.WriteString("\n\nTip: If this is an existing project, fresh clone, or shared-server recovery, run bd bootstrap first.\n")
+		b.WriteString("If bootstrap cannot find the expected remote automatically, set sync.remote\nin .beads/config.yaml and re-run bd bootstrap.\n")
+		b.WriteString("Use bd bootstrap --dry-run if you need to confirm the plan before it initializes anything.\n")
+		b.WriteString("Use bd init only when creating a brand-new project with no existing .beads data.")
 	}
 
 	return errors.New(b.String())

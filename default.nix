@@ -7,34 +7,36 @@
 }:
 buildGoModule {
   pname = "beads";
-  version = "0.60.0";
+  version = "1.2.1";
 
   src = self;
 
   # Point to the main Go package
   subPackages = [ "cmd/bd" ];
+  tags = [ "gms_pure_go" ];
   doCheck = false;
 
-  # Go module dependencies hash - if build fails with hash mismatch, update with the "got:" value
-  vendorHash = "sha256-1BJsEPP5SYZFGCWHLn532IUKlzcGDg5nhrqGWylEHgY=";
+  # proxyVendor avoids vendor/modules.txt consistency checks when the vendored
+  # tree lags go.mod/go.sum.
+  proxyVendor = true;
+  vendorHash = "sha256-D+KDoLFJHpt9D9rCrtE3NMfL4fgK7UxpdKlCxp5yz5Y=";
 
-  # Relax go.mod version for Nix: nixpkgs Go may lag behind the latest
-  # patch release, and GOTOOLCHAIN=auto can't download in the Nix sandbox.
+  # Match go.mod to the selected Nix Go toolchain. buildGoModule also builds
+  # vendored dependencies in the Nix sandbox, where toolchain downloads are not
+  # available.
   postPatch = ''
     goVer="$(go env GOVERSION | sed 's/^go//')"
     go mod edit -go="$goVer"
   '';
 
-  # Allow patch-level toolchain upgrades when a dependency's minimum Go patch
-  # version is newer than nixpkgs' bundled patch version.
-  env.GOTOOLCHAIN = "auto";
+  env.GOTOOLCHAIN = "local";
 
   # Git is required for tests
   nativeBuildInputs = [ git ];
 
   meta = with lib; {
     description = "beads (bd) - An issue tracker designed for AI-supervised coding workflows";
-    homepage = "https://github.com/steveyegge/beads";
+    homepage = "https://github.com/gastownhall/beads";
     license = licenses.mit;
     mainProgram = "bd";
     maintainers = [ ];

@@ -13,9 +13,20 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/steveyegge/beads/internal/storage/dolt"
 )
+
+type tipMetadataReader interface {
+	GetLocalMetadata(context.Context, string) (string, error)
+}
+
+type tipMetadataWriter interface {
+	SetLocalMetadata(context.Context, string, string) error
+}
+
+type tipMetadataStore interface {
+	tipMetadataReader
+	tipMetadataWriter
+}
 
 // Tip represents a contextual hint that can be shown to users after successful commands
 type Tip struct {
@@ -60,7 +71,7 @@ func initTipRand() {
 
 // maybeShowTip selects and displays an eligible tip based on priority and probability
 // Respects --json and --quiet flags
-func maybeShowTip(store *dolt.DoltStore) {
+func maybeShowTip(store tipMetadataStore) {
 	// Skip tips in JSON output mode or quiet mode
 	if jsonOutput || quietFlag {
 		return
@@ -84,7 +95,7 @@ func maybeShowTip(store *dolt.DoltStore) {
 
 // selectNextTip finds the next tip to show based on conditions, frequency, priority, and probability
 // Returns nil if no tip should be shown
-func selectNextTip(store *dolt.DoltStore) *Tip {
+func selectNextTip(store tipMetadataReader) *Tip {
 	if store == nil {
 		return nil
 	}
@@ -134,9 +145,9 @@ func selectNextTip(store *dolt.DoltStore) *Tip {
 
 // getLastShown retrieves the timestamp when a tip was last shown
 // Returns zero time if never shown
-func getLastShown(store *dolt.DoltStore, tipID string) time.Time {
+func getLastShown(store tipMetadataReader, tipID string) time.Time {
 	key := fmt.Sprintf("tip_%s_last_shown", tipID)
-	value, err := store.GetMetadata(context.Background(), key)
+	value, err := store.GetLocalMetadata(context.Background(), key)
 	if err != nil || value == "" {
 		return time.Time{}
 	}
@@ -151,7 +162,7 @@ func getLastShown(store *dolt.DoltStore, tipID string) time.Time {
 }
 
 // recordTipShown records the timestamp when a tip was shown
-func recordTipShown(store *dolt.DoltStore, tipID string) {
+func recordTipShown(store tipMetadataWriter, tipID string) {
 	if store == nil || tipID == "" {
 		return
 	}
@@ -173,7 +184,7 @@ func recordTipShown(store *dolt.DoltStore, tipID string) {
 
 	// Non-critical metadata, ok to fail silently.
 	// If it succeeds, track the write for tip auto-commit behavior.
-	if err := store.SetMetadata(context.Background(), key, value); err == nil {
+	if err := store.SetLocalMetadata(context.Background(), key, value); err == nil {
 		commandDidWriteTipMetadata = true
 		if commandTipIDsShown == nil {
 			commandTipIDsShown = make(map[string]struct{})
@@ -383,7 +394,7 @@ func initDefaultTips() {
 	// This is a proactive health check that trumps educational tips (ox-cli pattern)
 	InjectTip(
 		"sync_conflict",
-		"Run 'bd sync' to resolve sync conflict",
+		"Run 'bd dolt pull' to resolve sync conflict",
 		200, // Higher than Claude setup - sync issues are urgent
 		0,   // No frequency limit - always show when applicable
 		1.0, // 100% probability - always show when condition is true

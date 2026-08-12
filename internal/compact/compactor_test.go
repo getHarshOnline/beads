@@ -10,11 +10,13 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/testutil"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 func setupTestStorage(t *testing.T) *dolt.DoltStore {
 	t.Helper()
+	testutil.RequireDoltContainer(t)
 
 	store, err := dolt.New(context.Background(), &dolt.Config{Path: t.TempDir()})
 	if err != nil {
@@ -211,9 +213,6 @@ func TestCompactTier1_IneligibleIssue(t *testing.T) {
 }
 
 func TestCompactTier1_WithAPI(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow API test in short mode")
-	}
 	if os.Getenv("ANTHROPIC_API_KEY") == "" {
 		t.Skip("ANTHROPIC_API_KEY not set, skipping API test")
 	}
@@ -344,9 +343,6 @@ func TestCompactTier1Batch_WithIneligible(t *testing.T) {
 }
 
 func TestCompactTier1Batch_WithAPI(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow API test in short mode")
-	}
 	if os.Getenv("ANTHROPIC_API_KEY") == "" {
 		t.Skip("ANTHROPIC_API_KEY not set, skipping API test")
 	}

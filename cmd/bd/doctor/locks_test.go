@@ -3,6 +3,7 @@ package doctor
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -120,72 +121,6 @@ func TestCheckStaleLockFiles(t *testing.T) {
 		}
 	})
 
-	t.Run("fresh dolt-access.lock not stale", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		beadsDir := filepath.Join(tmpDir, ".beads")
-		if err := os.MkdirAll(beadsDir, 0755); err != nil {
-			t.Fatal(err)
-		}
-
-		lockPath := filepath.Join(beadsDir, "dolt-access.lock")
-		if err := os.WriteFile(lockPath, []byte("lock"), 0600); err != nil {
-			t.Fatal(err)
-		}
-
-		result := CheckStaleLockFiles(tmpDir)
-		if result.Status != StatusOK {
-			t.Errorf("expected OK for fresh dolt-access.lock, got %s: %s", result.Status, result.Message)
-		}
-	})
-
-	t.Run("stale dolt-access.lock detected", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		beadsDir := filepath.Join(tmpDir, ".beads")
-		if err := os.MkdirAll(beadsDir, 0755); err != nil {
-			t.Fatal(err)
-		}
-
-		lockPath := filepath.Join(beadsDir, "dolt-access.lock")
-		if err := os.WriteFile(lockPath, []byte("lock"), 0600); err != nil {
-			t.Fatal(err)
-		}
-		oldTime := time.Now().Add(-10 * time.Minute)
-		if err := os.Chtimes(lockPath, oldTime, oldTime); err != nil {
-			t.Fatal(err)
-		}
-
-		result := CheckStaleLockFiles(tmpDir)
-		if result.Status != StatusWarning {
-			t.Errorf("expected Warning for stale dolt-access.lock, got %s: %s", result.Status, result.Message)
-		}
-	})
-
-	// GH#1981: noms LOCK files are no longer checked by CheckStaleLockFiles.
-	// Age-based detection produced false positives because Dolt never deletes
-	// these files. Use CheckLockHealth (flock probing) instead.
-	t.Run("noms LOCK ignored by staleness check", func(t *testing.T) {
-		tmpDir := t.TempDir()
-		nomsDir := filepath.Join(tmpDir, ".beads", "dolt", "beads", ".dolt", "noms")
-		if err := os.MkdirAll(nomsDir, 0755); err != nil {
-			t.Fatal(err)
-		}
-
-		lockPath := filepath.Join(nomsDir, "LOCK")
-		if err := os.WriteFile(lockPath, []byte("lock"), 0600); err != nil {
-			t.Fatal(err)
-		}
-		// Even an old noms LOCK should not trigger a warning
-		oldTime := time.Now().Add(-10 * time.Minute)
-		if err := os.Chtimes(lockPath, oldTime, oldTime); err != nil {
-			t.Fatal(err)
-		}
-
-		result := CheckStaleLockFiles(tmpDir)
-		if result.Status != StatusOK {
-			t.Errorf("expected OK for noms LOCK (not checked by staleness), got %s: %s", result.Status, result.Message)
-		}
-	})
-
 	t.Run("multiple stale locks", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		beadsDir := filepath.Join(tmpDir, ".beads")
@@ -216,6 +151,34 @@ func TestCheckStaleLockFiles(t *testing.T) {
 		// Should mention count
 		if result.Message == "" {
 			t.Error("expected non-empty message for stale locks")
+		}
+	})
+
+	t.Run("shared worktree fallback detects stale locks", func(t *testing.T) {
+		clearResolveBeadsDirCache()
+		t.Cleanup(clearResolveBeadsDirCache)
+
+		mainRepoDir, worktreeDir := setupWorktreeRepo(t)
+		beadsDir := filepath.Join(mainRepoDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		lockPath := filepath.Join(beadsDir, "dolt.bootstrap.lock")
+		if err := os.WriteFile(lockPath, []byte("lock"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		oldTime := time.Now().Add(-10 * time.Minute)
+		if err := os.Chtimes(lockPath, oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
+
+		result := CheckStaleLockFiles(worktreeDir)
+		if result.Status != StatusWarning {
+			t.Fatalf("expected Warning for stale shared lock, got %s: %s", result.Status, result.Message)
+		}
+		if !strings.Contains(result.Message, "dolt.bootstrap.lock") {
+			t.Fatalf("expected stale lock message to mention dolt.bootstrap.lock, got %q", result.Message)
 		}
 	})
 }

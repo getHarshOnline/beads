@@ -199,28 +199,90 @@ func TestGenerateHookSection(t *testing.T) {
 func TestGenerateHookSection_Timeout(t *testing.T) {
 	section := generateHookSection("pre-push")
 
-	// Must use shell timeout command with configurable duration
+	// The duration is configurable but must be validated before it reaches a
+	// helper command line.
 	if !strings.Contains(section, "BEADS_HOOK_TIMEOUT") {
 		t.Error("section missing BEADS_HOOK_TIMEOUT env var")
 	}
 	if !strings.Contains(section, fmt.Sprintf("%d", hookTimeoutSeconds)) {
 		t.Errorf("section missing default timeout %d", hookTimeoutSeconds)
 	}
-	if !strings.Contains(section, "command -v timeout") {
-		t.Error("section missing timeout availability check")
+	if !strings.Contains(section, `*[^0-9]*`) && !strings.Contains(section, `*[!0-9]*`) {
+		t.Error("section missing positive-integer timeout validation")
+	}
+	if !strings.Contains(section, "invalid BEADS_HOOK_TIMEOUT") {
+		t.Error("section missing invalid-timeout warning")
 	}
 
-	// Timeout exit code (124) must be handled gracefully — continue, don't block git
-	if !strings.Contains(section, "_bd_exit -eq 124") {
+	// A name match is insufficient: native Windows has an incompatible
+	// timeout.exe. Require a successful GNU identity probe for timeout or
+	// gtimeout before invoking it.
+	if !strings.Contains(section, "for _bd_timeout_candidate in timeout gtimeout") {
+		t.Error("section missing ordered timeout/gtimeout capability probes")
+	}
+	if !strings.Contains(section, `if _bd_timeout_version="$("$_bd_timeout_candidate" --version 2>/dev/null)"; then`) {
+		t.Error("section does not require a successful version probe")
+	}
+	if !strings.Contains(section, `"timeout (GNU coreutils) "*`) {
+		t.Error("section missing GNU coreutils identity check")
+	}
+	if !strings.Contains(section, `"$_bd_timeout_command" -- "$_bd_timeout"`) {
+		t.Error("section missing GNU timeout argv separator")
+	}
+	if !strings.Contains(section, "perl -e 'alarm shift; exec @ARGV' --") {
+		t.Error("section missing perl alarm fallback for stock macOS")
+	}
+	if !strings.Contains(section, "_bd_timeout_backend=perl") {
+		t.Error("section missing scoped perl backend marker")
+	}
+
+	// GNU deadline statuses and Perl SIGALRM are scoped to the backend that can
+	// synthesize them. The direct fallback must not swallow a natural 124/142.
+	if !strings.Contains(section, `"$_bd_exit" -eq 124`) {
 		t.Error("section missing timeout exit code handling")
+	}
+	if !strings.Contains(section, `"$_bd_timeout_backend" = perl`) || !strings.Contains(section, `"$_bd_exit" -eq 142`) {
+		t.Error("section missing perl-scoped SIGALRM timeout exit code handling")
 	}
 	if !strings.Contains(section, "timed out") {
 		t.Error("section missing timeout warning message")
 	}
 
-	// Fallback path when timeout command is not available (e.g. macOS without coreutils)
-	if !strings.Contains(section, "else") {
-		t.Error("section missing fallback for systems without timeout command")
+	// Last-resort path is explicit when no timeout implementation is available.
+	if !strings.Contains(section, "running without timeout") {
+		t.Error("section missing clear fallback warning for systems without timeout support")
+	}
+}
+
+func TestTrackedManagedHookSectionsMatchGenerator(t *testing.T) {
+	for _, hookName := range managedHookNames {
+		hookName := hookName
+		t.Run(hookName, func(t *testing.T) {
+			path := filepath.Join("..", "..", ".githooks", hookName)
+			content, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read tracked hook %s: %v", path, err)
+			}
+
+			tracked := string(content)
+			begin := strings.Index(tracked, hookSectionBeginLine())
+			if begin < 0 {
+				t.Fatalf("tracked hook missing %q", hookSectionBeginLine())
+			}
+			endMarker := hookSectionEndLine() + "\n"
+			relativeEnd := strings.Index(tracked[begin:], endMarker)
+			if relativeEnd < 0 {
+				t.Fatalf("tracked hook missing %q", hookSectionEndLine())
+			}
+			end := begin + relativeEnd + len(endMarker)
+
+			if got, want := tracked[begin:end], generateHookSection(hookName); got != want {
+				t.Fatalf("tracked managed section drifted from generator\nwant:\n%s\ngot:\n%s", want, got)
+			}
+			if strings.Count(tracked, hookSectionBeginPrefix) != 1 || strings.Count(tracked, hookSectionEndPrefix) != 1 {
+				t.Fatal("tracked hook must contain exactly one managed section")
+			}
+		})
 	}
 }
 
@@ -229,7 +291,7 @@ func TestGenerateHookSection_DBNotInitialized(t *testing.T) {
 	section := generateHookSection("pre-commit")
 
 	// Exit code 3 = beads database not initialized; hook must continue gracefully
-	if !strings.Contains(section, "_bd_exit -eq 3") {
+	if !strings.Contains(section, `"$_bd_exit" -eq 3`) {
 		t.Error("section missing exit code 3 (DB not initialized) handling")
 	}
 	if !strings.Contains(section, "database not initialized") {
@@ -238,7 +300,7 @@ func TestGenerateHookSection_DBNotInitialized(t *testing.T) {
 
 	// After handling exit code 3, the effective exit must be 0 (success)
 	// Verify the pattern: set _bd_exit=0 after detecting code 3
-	if !strings.Contains(section, "if [ $_bd_exit -eq 3 ]; then") {
+	if !strings.Contains(section, `if [ "$_bd_exit" -eq 3 ]; then`) {
 		t.Error("section missing exit code 3 conditional")
 	}
 }
@@ -736,6 +798,12 @@ func TestInstallHooksBeads_WorktreeAccess(t *testing.T) {
 			t.Fatalf("Failed to create metadata.json: %v", err)
 		}
 
+		cmd := exec.Command("git", "commit", "--allow-empty", "--no-verify", "-m", "init")
+		cmd.Dir = tmpDir
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git commit failed: %v\n%s", err, string(output))
+		}
+
 		// Install hooks with --beads
 		if err := installHooksWithOptions(managedHookNames, false, false, false, true); err != nil {
 			t.Fatalf("installHooksWithOptions(beads=true) failed: %v", err)
@@ -761,7 +829,7 @@ func TestInstallHooksBeads_WorktreeAccess(t *testing.T) {
 
 		// Create a worktree and verify hooks are accessible from it
 		worktreeDir := filepath.Join(t.TempDir(), "worktree")
-		cmd := exec.Command("git", "worktree", "add", worktreeDir, "-b", "test-worktree")
+		cmd = exec.Command("git", "worktree", "add", worktreeDir, "-b", "test-worktree")
 		cmd.Dir = tmpDir
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git worktree add failed: %v\n%s", err, string(output))
@@ -792,6 +860,132 @@ func TestInstallHooksBeads_WorktreeAccess(t *testing.T) {
 		preCommitPath := filepath.Join(wtHooksPath, "pre-commit")
 		if _, err := os.Stat(preCommitPath); err != nil {
 			t.Errorf("pre-commit hook not accessible from worktree: %v", err)
+		}
+	})
+}
+
+// setupBeadsDir creates .beads/ with a minimal metadata.json so FindBeadsDir works.
+func setupBeadsDir(t *testing.T, repoDir string) string {
+	t.Helper()
+	beadsDir := filepath.Join(repoDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0750); err != nil {
+		t.Fatalf("failed to create .beads/: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{}`), 0644); err != nil {
+		t.Fatalf("failed to create metadata.json: %v", err)
+	}
+	return beadsDir
+}
+
+// TestInstallHooksBeads_PreservesGlobalHooks is a regression test: bd init sets
+// a local core.hooksPath that shadows the global one, silently killing global
+// hooks. The fix copies hooks from the effective directory before overriding.
+func TestInstallHooksBeads_PreservesGlobalHooks(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(fakeHome, ".config"))
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(fakeHome, ".gitconfig"))
+
+	globalHooksDir := filepath.Join(fakeHome, "global-hooks")
+	if err := os.MkdirAll(globalHooksDir, 0755); err != nil {
+		t.Fatalf("failed to create global hooks dir: %v", err)
+	}
+	globalHookContent := "#!/bin/sh\necho global-hook-marker\n"
+	if err := os.WriteFile(filepath.Join(globalHooksDir, "pre-commit"), []byte(globalHookContent), 0755); err != nil {
+		t.Fatalf("failed to write global pre-commit hook: %v", err)
+	}
+
+	setGlobal := exec.Command("git", "config", "--global", "core.hooksPath", globalHooksDir)
+	if out, err := setGlobal.CombinedOutput(); err != nil {
+		t.Fatalf("failed to set global core.hooksPath: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	// Manual repo init (can't use newGitRepo which sets a local core.hooksPath).
+	repoDir := t.TempDir()
+	initCmd := exec.Command("git", "init", "--initial-branch=main")
+	initCmd.Dir = repoDir
+	if err := initCmd.Run(); err != nil {
+		t.Fatalf("git init failed: %v", err)
+	}
+	for _, args := range [][]string{
+		{"config", "user.email", "test@test.com"},
+		{"config", "user.name", "Test User"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git config %v failed: %v", args, err)
+		}
+	}
+
+	runInDir(t, repoDir, func() {
+		beadsDir := setupBeadsDir(t, repoDir)
+
+		if err := installHooksWithOptions(managedHookNames, false, false, false, true); err != nil {
+			t.Fatalf("installHooksWithOptions(beads=true) failed: %v", err)
+		}
+
+		content, err := os.ReadFile(filepath.Join(beadsDir, "hooks", "pre-commit"))
+		if err != nil {
+			t.Fatalf("failed to read .beads/hooks/pre-commit: %v", err)
+		}
+		contentStr := string(content)
+
+		if !strings.Contains(contentStr, "echo global-hook-marker") {
+			t.Errorf("global hook content not preserved in .beads/hooks/pre-commit.\nGot:\n%s", contentStr)
+		}
+		if !strings.Contains(contentStr, hookSectionBeginPrefix) {
+			t.Errorf("beads section marker missing.\nGot:\n%s", contentStr)
+		}
+	})
+}
+
+// TestInstallHooksBeads_PreservesDefaultGitHooks verifies that hooks in the
+// default .git/hooks/ directory (both managed and non-managed) are preserved
+// when beads redirects core.hooksPath to .beads/hooks/.
+func TestInstallHooksBeads_PreservesDefaultGitHooks(t *testing.T) {
+	repoDir := newGitRepo(t)
+	runInDir(t, repoDir, func() {
+		hooksDir := filepath.Join(repoDir, ".git", "hooks")
+		if err := os.MkdirAll(hooksDir, 0755); err != nil {
+			t.Fatalf("failed to create .git/hooks: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(hooksDir, "pre-commit"), []byte("#!/bin/sh\necho custom-default-hook\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(hooksDir, "commit-msg"), []byte("#!/bin/sh\necho commit-msg-hook\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Unset the local core.hooksPath that newGitRepo sets so git falls back to .git/hooks/.
+		exec.Command("git", "config", "--unset", "core.hooksPath").Run()
+
+		beadsDir := setupBeadsDir(t, repoDir)
+
+		if err := installHooksWithOptions(managedHookNames, false, false, false, true); err != nil {
+			t.Fatalf("installHooksWithOptions(beads=true) failed: %v", err)
+		}
+
+		// Managed hook: should be preserved with beads section injected.
+		content, err := os.ReadFile(filepath.Join(beadsDir, "hooks", "pre-commit"))
+		if err != nil {
+			t.Fatalf("failed to read .beads/hooks/pre-commit: %v", err)
+		}
+		contentStr := string(content)
+		if !strings.Contains(contentStr, "echo custom-default-hook") {
+			t.Errorf(".git/hooks/pre-commit content not preserved.\nGot:\n%s", contentStr)
+		}
+		if !strings.Contains(contentStr, hookSectionBeginPrefix) {
+			t.Errorf("beads section marker missing.\nGot:\n%s", contentStr)
+		}
+
+		// Non-managed hook: should be copied as-is.
+		cmContent, err := os.ReadFile(filepath.Join(beadsDir, "hooks", "commit-msg"))
+		if err != nil {
+			t.Fatalf("non-managed hook commit-msg not copied to .beads/hooks/: %v", err)
+		}
+		if !strings.Contains(string(cmContent), "echo commit-msg-hook") {
+			t.Errorf("Unmanaged hook content not preserved.\nGot:\n%s", string(cmContent))
 		}
 	})
 }
@@ -950,5 +1144,227 @@ func TestHooksNeedUpdate(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// TestInstallHooksBeads_HuskyV8Helper verifies that the husky v8 _/ helper
+// directory is symlinked when hooks are preserved from a husky-managed directory.
+// GH#3132 Bug 1: without this, hooks that source $(dirname "$0")/_/husky.sh fail.
+func TestInstallHooksBeads_HuskyV8Helper(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(fakeHome, ".config"))
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(fakeHome, ".gitconfig"))
+
+	// Create a husky v8-style hooks directory
+	huskyDir := filepath.Join(fakeHome, "husky-hooks")
+	huskyHelperDir := filepath.Join(huskyDir, "_")
+	if err := os.MkdirAll(huskyHelperDir, 0755); err != nil {
+		t.Fatalf("mkdir husky helper: %v", err)
+	}
+	huskyShContent := "#!/usr/bin/env sh\n# husky v8 helper\n"
+	if err := os.WriteFile(filepath.Join(huskyHelperDir, "husky.sh"), []byte(huskyShContent), 0755); err != nil {
+		t.Fatalf("write husky.sh: %v", err)
+	}
+	// Hook that sources the helper via relative path
+	hookContent := "#!/usr/bin/env sh\n. \"$(dirname -- \"$0\")/_/husky.sh\"\nnpx lint-staged\n"
+	if err := os.WriteFile(filepath.Join(huskyDir, "pre-commit"), []byte(hookContent), 0755); err != nil {
+		t.Fatalf("write pre-commit: %v", err)
+	}
+
+	// Set as global hooks path (simulating husky v8)
+	setGlobal := exec.Command("git", "config", "--global", "core.hooksPath", huskyDir)
+	if out, err := setGlobal.CombinedOutput(); err != nil {
+		t.Fatalf("set global core.hooksPath: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	repoDir := t.TempDir()
+	initCmd := exec.Command("git", "init", "--initial-branch=main")
+	initCmd.Dir = repoDir
+	if err := initCmd.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	for _, args := range [][]string{
+		{"config", "user.email", "test@test.com"},
+		{"config", "user.name", "Test"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git config %v: %v", args, err)
+		}
+	}
+
+	runInDir(t, repoDir, func() {
+		beadsDir := setupBeadsDir(t, repoDir)
+
+		if err := installHooksWithOptions(managedHookNames, false, false, false, true); err != nil {
+			t.Fatalf("installHooksWithOptions: %v", err)
+		}
+
+		// Verify the _/ symlink was created
+		tgtHelper := filepath.Join(beadsDir, "hooks", "_")
+		info, err := os.Lstat(tgtHelper)
+		if err != nil {
+			t.Fatalf("expected _/ symlink in .beads/hooks/: %v", err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("expected _/ to be a symlink, got mode %v", info.Mode())
+		}
+
+		// Verify the symlink target resolves to the original helper
+		target, err := os.Readlink(tgtHelper)
+		if err != nil {
+			t.Fatalf("readlink: %v", err)
+		}
+		resolved := filepath.Join(filepath.Dir(tgtHelper), target, "husky.sh")
+		if _, err := os.Stat(resolved); err != nil {
+			t.Errorf("symlink does not resolve to husky.sh: %v (target=%s)", err, target)
+		}
+
+		// Verify the hook content was preserved
+		content, err := os.ReadFile(filepath.Join(beadsDir, "hooks", "pre-commit"))
+		if err != nil {
+			t.Fatalf("read pre-commit: %v", err)
+		}
+		if !strings.Contains(string(content), "npx lint-staged") {
+			t.Errorf("hook content not preserved.\nGot:\n%s", string(content))
+		}
+	})
+}
+
+// TestInstallHooksBeads_HuskyV9Shims verifies that husky v9 shims are replaced
+// with actual user hook content when preserved.
+// GH#3132 Bug 2: husky v9's h dispatcher uses dirname(dirname($0)) which breaks
+// when hooks are relocated from .husky/_/ to .beads/hooks/.
+func TestInstallHooksBeads_HuskyV9Shims(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(fakeHome, ".config"))
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(fakeHome, ".gitconfig"))
+
+	// Create husky v9 directory structure:
+	// .husky/
+	//   pre-commit   <- user's actual commands
+	//   _/
+	//     h           <- dispatcher
+	//     pre-commit  <- shim that sources h
+	huskyBase := filepath.Join(fakeHome, "project", ".husky")
+	huskyInner := filepath.Join(huskyBase, "_")
+	if err := os.MkdirAll(huskyInner, 0755); err != nil {
+		t.Fatalf("mkdir .husky/_: %v", err)
+	}
+
+	// User's actual hook commands (in .husky/)
+	userHookContent := "npm run minify-templates\nnpx lint-staged --allow-empty\n"
+	if err := os.WriteFile(filepath.Join(huskyBase, "pre-commit"), []byte(userHookContent), 0644); err != nil {
+		t.Fatalf("write user hook: %v", err)
+	}
+
+	// Husky v9 dispatcher (in .husky/_/)
+	hDispatcher := `#!/usr/bin/env sh
+n=$(basename "$0")
+s=$(dirname "$(dirname "$0")")/$n
+[ ! -f "$s" ] && exit 0
+. "$s"
+`
+	if err := os.WriteFile(filepath.Join(huskyInner, "h"), []byte(hDispatcher), 0755); err != nil {
+		t.Fatalf("write h dispatcher: %v", err)
+	}
+
+	// Husky v9 shim (in .husky/_/)
+	shimContent := "#!/usr/bin/env sh\n. \"$(dirname \"$0\")/h\"\n"
+	if err := os.WriteFile(filepath.Join(huskyInner, "pre-commit"), []byte(shimContent), 0755); err != nil {
+		t.Fatalf("write shim: %v", err)
+	}
+
+	// Set core.hooksPath to .husky/_/ (husky v9 style)
+	setGlobal := exec.Command("git", "config", "--global", "core.hooksPath", huskyInner)
+	if out, err := setGlobal.CombinedOutput(); err != nil {
+		t.Fatalf("set global core.hooksPath: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	repoDir := t.TempDir()
+	initCmd := exec.Command("git", "init", "--initial-branch=main")
+	initCmd.Dir = repoDir
+	if err := initCmd.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	for _, args := range [][]string{
+		{"config", "user.email", "test@test.com"},
+		{"config", "user.name", "Test"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoDir
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git config %v: %v", args, err)
+		}
+	}
+
+	runInDir(t, repoDir, func() {
+		beadsDir := setupBeadsDir(t, repoDir)
+
+		if err := installHooksWithOptions(managedHookNames, false, false, false, true); err != nil {
+			t.Fatalf("installHooksWithOptions: %v", err)
+		}
+
+		// Verify the h dispatcher was removed
+		hTarget := filepath.Join(beadsDir, "hooks", "h")
+		if _, err := os.Stat(hTarget); !os.IsNotExist(err) {
+			t.Error("h dispatcher should have been removed from .beads/hooks/")
+		}
+
+		// Verify the shim was replaced with actual user hook content
+		content, err := os.ReadFile(filepath.Join(beadsDir, "hooks", "pre-commit"))
+		if err != nil {
+			t.Fatalf("read pre-commit: %v", err)
+		}
+		contentStr := string(content)
+
+		// Should contain the user's actual commands, not the shim
+		if strings.Contains(contentStr, `. "$(dirname "$0")/h"`) {
+			t.Error("shim content should have been replaced with user hook content")
+		}
+		if !strings.Contains(contentStr, "npx lint-staged --allow-empty") {
+			t.Errorf("user hook content not found.\nGot:\n%s", contentStr)
+		}
+		if !strings.Contains(contentStr, "npm run minify-templates") {
+			t.Errorf("user hook content not found.\nGot:\n%s", contentStr)
+		}
+
+		// Should have a shebang (added since user hooks in .husky/ often omit it)
+		if !strings.HasPrefix(contentStr, "#!") {
+			t.Error("preserved hook should have a shebang")
+		}
+
+		// Beads section should also be present (injected by installHooksWithOptions)
+		if !strings.Contains(contentStr, hookSectionBeginPrefix) {
+			t.Errorf("beads section marker missing.\nGot:\n%s", contentStr)
+		}
+	})
+}
+
+// TestFixHuskyHookLayout_NoHusky verifies the fix is a no-op for non-husky directories.
+func TestFixHuskyHookLayout_NoHusky(t *testing.T) {
+	sourceDir := t.TempDir()
+	targetDir := t.TempDir()
+
+	// Write a normal hook (no husky)
+	if err := os.WriteFile(filepath.Join(sourceDir, "pre-commit"), []byte("#!/bin/sh\necho hi\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "pre-commit"), []byte("#!/bin/sh\necho hi\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	fixHuskyHookLayout(sourceDir, targetDir)
+
+	// No _/ symlink should be created
+	if _, err := os.Lstat(filepath.Join(targetDir, "_")); !os.IsNotExist(err) {
+		t.Error("_/ should not exist for non-husky directories")
+	}
+	// No h file to remove
+	if _, err := os.Stat(filepath.Join(targetDir, "h")); !os.IsNotExist(err) {
+		t.Error("h should not exist")
 	}
 }

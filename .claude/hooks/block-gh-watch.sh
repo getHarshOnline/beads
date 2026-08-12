@@ -1,5 +1,5 @@
 #!/bin/bash
-# Block commands that burn through GitHub API rate limits.
+# Block commands that burn through GitHub API rate limits or violate workflow.
 # The GitHub API allows 5000 requests/hour. `gh run watch` polls every 3
 # seconds (1200 req/hr), and has repeatedly exhausted the quota during
 # releases, blocking all crew members for up to an hour.

@@ -4,17 +4,17 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
-	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/validation"
+	"github.com/steveyegge/beads/issueops"
 )
 
 var (
@@ -303,35 +303,73 @@ func parseMarkdownFile(path string) ([]*IssueTemplate, error) {
 	return state.finalize()
 }
 
-// createIssuesFromMarkdown parses a markdown file and creates multiple issues from it
-func createIssuesFromMarkdown(_ *cobra.Command, filepath string) {
-	// Parse markdown file first (doesn't require store access)
-	templates, err := parseMarkdownFile(filepath)
+// createIssuesFromMarkdown creates every issue in a markdown file as ONE act,
+// through issueops.BatchCreator. It parses the file, lints it, builds one
+// request and prints what came back; the proxied route builds the SAME request.
+func createIssuesFromMarkdown(ctx context.Context, in createInput) error {
+	templates, err := parseMarkdownFile(in.markdownFile)
 	if err != nil {
-		FatalError("parsing markdown file: %v", err)
+		return HandleError("parsing markdown file: %v", err)
 	}
-
 	if len(templates) == 0 {
-		FatalError("no issues found in markdown file")
+		return HandleError("no issues found in markdown file")
 	}
-
-	// Ensure globals are initialized
 	if store == nil {
-		FatalErrorWithHint("database not initialized",
-			"run 'bd doctor' to diagnose, or 'bd init' to create a new database")
+		return HandleErrorWithHint("database not initialized", diagHint())
 	}
-	if actor == "" {
-		actor = "bd" // Default actor if not set
+	request, err := buildMarkdownBatchRequest(templates, in)
+	if err != nil {
+		return err
 	}
+	// The role creates its Dolt version commit inside the storage layer, so
+	// `--dolt-auto-commit batch` can only defer it by saying so on the context.
+	// commitPendingIfEmbedded below is the OTHER half and cannot substitute: it
+	// correctly no-ops in batch mode, which is exactly why forgetting this line
+	// produces a per-write commit that nothing later suppresses.
+	opsCtx, err := issueOpsContext(ctx)
+	if err != nil {
+		return HandleError("%v", err)
+	}
+	creator, err := store.BatchCreator()
+	if err != nil {
+		return HandleError("%v", err)
+	}
+	result, err := creator.CreateBatch(opsCtx, request)
+	if err != nil {
+		return HandleError("creating issues from markdown: %v", err)
+	}
+	issueIDs := make([]string, 0, len(result.Issues))
+	for _, issue := range result.Issues {
+		issueIDs = append(issueIDs, issue.ID)
+	}
+	if err := commitPendingIfEmbedded(ctx, store, request.Actor, doltAutoCommitParams{
+		Command:         "create",
+		IssueIDs:        issueIDs,
+		MessageOverride: request.Provenance,
+	}); err != nil {
+		WarnError("failed to commit: %v", err)
+	}
+	return reportMarkdownBatch(result.Issues, in)
+}
 
-	ctx := rootCtx
-	createdIssues := []*types.Issue{}
-
-	// Create all issues, labels, and dependencies in a single transaction
-	commitMsg := fmt.Sprintf("bd: create %d issue(s) from %s", len(templates), filepath)
-	txErr := transact(ctx, store, commitMsg, func(tx storage.Transaction) error {
-		for _, template := range templates {
-			issue := &types.Issue{
+// buildMarkdownBatchRequest is the ONE projection of a parsed markdown file
+// onto the role's request, shared by both front doors, so the two routes cannot
+// answer differently.
+//
+// It lints first, because the lint is about the FILE the user wrote and
+// refusing it here costs no transaction.
+func buildMarkdownBatchRequest(templates []*IssueTemplate, in createInput) (issueops.CreateBatchRequest, error) {
+	if err := lintMarkdownTemplates(templates, in); err != nil {
+		return issueops.CreateBatchRequest{}, err
+	}
+	items := make([]issueops.BatchCreateItem, 0, len(templates))
+	for _, template := range templates {
+		dependencies, err := parseMarkdownDependencies(template.Dependencies, template.Title)
+		if err != nil {
+			return issueops.CreateBatchRequest{}, HandleError("%v", err)
+		}
+		items = append(items, issueops.BatchCreateItem{
+			Issue: &types.Issue{
 				Title:              template.Title,
 				Description:        template.Description,
 				Design:             template.Design,
@@ -340,67 +378,102 @@ func createIssuesFromMarkdown(_ *cobra.Command, filepath string) {
 				Priority:           template.Priority,
 				IssueType:          template.IssueType,
 				Assignee:           template.Assignee,
-			}
+				Labels:             template.Labels,
+				Ephemeral:          in.ephemeral,
+				NoHistory:          in.noHistory,
+				MolType:            in.molType,
+				CreatedBy:          in.createdBy,
+				Owner:              in.owner,
+			},
+			Dependencies: dependencies,
+		})
+	}
+	return issueops.CreateBatchRequest{
+		Actor: markdownBatchActor(in),
+		Items: items,
+		// The entry both routes have always written, spelled once. The role's
+		// own default would name a count and lose the file, which is the thing
+		// `bd dolt log` is read for after a bulk create.
+		Provenance: fmt.Sprintf("bd: create %d issue(s) from %s", len(templates), in.markdownFile),
+	}, nil
+}
 
-			if err := tx.CreateIssue(ctx, issue, actor); err != nil {
-				return fmt.Errorf("creating issue '%s': %w", template.Title, err)
-			}
+// markdownBatchActor is the actor a `--file` create is attributed to. The role
+// refuses an empty one, and "bd" is the fallback this command has always used
+// when nothing named a person.
+func markdownBatchActor(in createInput) string {
+	if in.createdBy != "" {
+		return in.createdBy
+	}
+	if actor != "" {
+		return actor
+	}
+	return "bd"
+}
 
-			for _, label := range template.Labels {
-				if err := tx.AddLabel(ctx, issue.ID, label, actor); err != nil {
-					return fmt.Errorf("adding label %s to %s: %w", label, issue.ID, err)
-				}
-			}
-
-			for _, depSpec := range template.Dependencies {
-				depSpec = strings.TrimSpace(depSpec)
-				if depSpec == "" {
-					continue
-				}
-
-				var depType types.DependencyType
-				var dependsOnID string
-
-				if strings.Contains(depSpec, ":") {
-					parts := strings.SplitN(depSpec, ":", 2)
-					if len(parts) != 2 {
-						return fmt.Errorf("invalid dependency format '%s' for %s", depSpec, issue.ID)
-					}
-					depType = types.DependencyType(strings.TrimSpace(parts[0]))
-					dependsOnID = strings.TrimSpace(parts[1])
-				} else {
-					depType = types.DepBlocks
-					dependsOnID = depSpec
-				}
-
-				if !depType.IsValid() {
-					return fmt.Errorf("invalid dependency type '%s' for %s", depType, issue.ID)
-				}
-
-				dep := &types.Dependency{
-					IssueID:     issue.ID,
-					DependsOnID: dependsOnID,
-					Type:        depType,
-				}
-				if err := tx.AddDependency(ctx, dep, actor); err != nil {
-					return fmt.Errorf("adding dependency %s -> %s: %w", issue.ID, dependsOnID, err)
-				}
-			}
-
-			createdIssues = append(createdIssues, issue)
-		}
+// lintMarkdownTemplates applies the workspace's validation.on-create policy to
+// every template, the same policy the single-issue create applies to its one
+// issue.
+func lintMarkdownTemplates(templates []*IssueTemplate, in createInput) error {
+	if in.validationMode != "error" && in.validationMode != "warn" {
 		return nil
-	})
-	if txErr != nil {
-		FatalError("creating issues from markdown: %v", txErr)
 	}
-
-	if jsonOutput {
-		outputJSON(createdIssues)
-	} else {
-		fmt.Printf("%s Created %d issues from %s:\n", ui.RenderPass("✓"), len(createdIssues), filepath)
-		for _, issue := range createdIssues {
-			fmt.Printf("  %s: %s [P%d, %s]\n", issue.ID, issue.Title, issue.Priority, issue.IssueType)
+	for _, template := range templates {
+		lintIssue := &types.Issue{
+			IssueType:          template.IssueType,
+			Description:        template.Description,
+			AcceptanceCriteria: template.AcceptanceCriteria,
+		}
+		if err := validation.LintIssue(lintIssue); err != nil {
+			if in.validationMode == "error" {
+				return HandleError("template %q: %v", template.Title, err)
+			}
+			fmt.Fprintf(os.Stderr, "%s template %q: %v\n", ui.RenderWarn("⚠"), template.Title, err)
 		}
 	}
+	return nil
+}
+
+// parseMarkdownDependencies reads a template's `### Dependencies` section as
+// the role's edge specs. `type:target` names the type; a bare target blocks.
+func parseMarkdownDependencies(deps []string, templateTitle string) ([]issueops.CreateDependency, error) {
+	var out []issueops.CreateDependency
+	for _, raw := range deps {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+
+		var depType types.DependencyType
+		var target string
+		if strings.Contains(raw, ":") {
+			parts := strings.SplitN(raw, ":", 2)
+			if len(parts) != 2 {
+				return nil, fmt.Errorf("invalid dependency format %q for issue %q", raw, templateTitle)
+			}
+			depType = types.DependencyType(strings.TrimSpace(parts[0]))
+			target = strings.TrimSpace(parts[1])
+		} else {
+			depType = types.DepBlocks
+			target = raw
+		}
+		if !depType.IsValid() {
+			return nil, fmt.Errorf("invalid dependency type %q for issue %q", depType, templateTitle)
+		}
+		out = append(out, issueops.CreateDependency{Type: depType, TargetID: target})
+	}
+	return out, nil
+}
+
+// reportMarkdownBatch prints what the batch created, in the one shape both
+// routes print.
+func reportMarkdownBatch(issues []*types.Issue, in createInput) error {
+	if in.jsonOutput {
+		return outputJSON(issues)
+	}
+	fmt.Printf("%s Created %d issues from %s:\n", ui.RenderPass("✓"), len(issues), in.markdownFile)
+	for _, issue := range issues {
+		fmt.Printf("  %s: %s [P%d, %s]\n", issue.ID, issue.Title, issue.Priority, issue.IssueType)
+	}
+	return nil
 }

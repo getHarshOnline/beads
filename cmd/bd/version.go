@@ -3,16 +3,20 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/metrics"
 )
 
 var (
 	// Version is the current version of bd (overridden by ldflags at build time)
-	Version = "0.60.0"
+	Version = "1.2.1"
 	// Build can be set via ldflags at compile time
 	Build = "dev"
 	// Commit and branch the git revision the binary was built from (optional ldflag)
@@ -21,9 +25,18 @@ var (
 )
 
 var versionCmd = &cobra.Command{
-	Use:   "version",
-	Short: "Print version information",
-	Run: func(cmd *cobra.Command, args []string) {
+	Use:           "version",
+	Short:         "Print version information",
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("version")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		commit := resolveCommitHash()
 		branch := resolveBranch()
 
@@ -38,7 +51,9 @@ var versionCmd = &cobra.Command{
 			if branch != "" {
 				result["branch"] = branch
 			}
-			outputJSON(result)
+			if err := outputJSON(result); err != nil {
+				return err
+			}
 		} else {
 			if commit != "" && branch != "" {
 				fmt.Printf("bd version %s (%s: %s@%s)\n", Version, Build, branch, shortCommit(commit))
@@ -48,6 +63,16 @@ var versionCmd = &cobra.Command{
 				fmt.Printf("bd version %s (%s)\n", Version, Build)
 			}
 		}
+
+		// Check for multiple bd binaries in PATH
+		if dups := findDuplicateBinaries(); len(dups) > 1 {
+			fmt.Fprintf(os.Stderr, "\nWarning: multiple 'bd' binaries found in PATH:\n")
+			for _, p := range dups {
+				fmt.Fprintf(os.Stderr, "  %s\n", p)
+			}
+			fmt.Fprintf(os.Stderr, "The first one is being used. Remove duplicates to avoid confusion.\n")
+		}
+		return nil
 	},
 }
 
@@ -105,4 +130,38 @@ func resolveBranch() string {
 	}
 
 	return ""
+}
+
+// findDuplicateBinaries searches PATH for all "bd" executables.
+// Returns their full paths. If len > 1, there are duplicates.
+func findDuplicateBinaries() []string {
+	name := "bd"
+	if runtime.GOOS == "windows" {
+		name = "bd.exe"
+	}
+
+	seen := make(map[string]bool)
+	var paths []string
+
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		candidate := filepath.Join(dir, name)
+		// Resolve symlinks so we don't double-count
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			// Try the raw path (might be a valid binary without symlinks)
+			resolved = candidate
+		}
+		info, err := os.Stat(candidate)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			continue
+		}
+		if !seen[resolved] {
+			seen[resolved] = true
+			paths = append(paths, candidate)
+		}
+	}
+	return paths
 }

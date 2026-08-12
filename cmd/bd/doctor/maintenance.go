@@ -1,5 +1,3 @@
-//go:build cgo
-
 package doctor
 
 import (
@@ -255,12 +253,12 @@ func checkPersistentMolIssuesForIssues(issues []*types.Issue) DoctorCheck {
 	}
 }
 
-// CheckStaleMQFiles detects legacy .beads/mq/*.json files from gastown.
+// CheckStaleMQFiles detects legacy .beads/mq/*.json files from the orchestrator.
 // These files are LOCAL ONLY (not committed) and represent stale merge queue
 // entries from the old mrqueue implementation. They are safe to delete since
 // gt done already creates merge-request wisps in beads.
 func CheckStaleMQFiles(path string) DoctorCheck {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 	mqDir := filepath.Join(beadsDir, "mq")
 
 	if _, err := os.Stat(mqDir); os.IsNotExist(err) {
@@ -286,7 +284,7 @@ func CheckStaleMQFiles(path string) DoctorCheck {
 		Name:     "Legacy MQ Files",
 		Status:   StatusWarning,
 		Message:  fmt.Sprintf("%d stale .beads/mq/*.json file(s)", len(files)),
-		Detail:   "Legacy gastown merge queue files (local only, safe to delete)",
+		Detail:   "Legacy orchestrator merge queue files (local only, safe to delete)",
 		Fix:      "Run 'bd doctor --fix' to delete, or 'rm -rf .beads/mq/'",
 		Category: CategoryMaintenance,
 	}
@@ -294,7 +292,7 @@ func CheckStaleMQFiles(path string) DoctorCheck {
 
 // FixStaleMQFiles removes the legacy .beads/mq/ directory and all its contents.
 func FixStaleMQFiles(path string) error {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 	mqDir := filepath.Join(beadsDir, "mq")
 
 	if _, err := os.Stat(mqDir); os.IsNotExist(err) {
@@ -507,7 +505,7 @@ func getPatrolPollutionIDs(path string) ([]string, error) {
 // It prefers Dolt (source of truth) and falls back to legacy JSONL for
 // backwards compatibility with non-Dolt installations.
 func loadMaintenanceIssues(path string) ([]*types.Issue, error) {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	issues, err := loadMaintenanceIssuesFromDatabase(beadsDir)
 	if err == nil {
@@ -524,7 +522,7 @@ func loadMaintenanceIssues(path string) ([]*types.Issue, error) {
 
 func loadMaintenanceIssuesFromDatabase(beadsDir string) ([]*types.Issue, error) {
 	ctx := context.Background()
-	store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
+	store, err := dolt.NewFromConfigWithCLIOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
@@ -559,7 +557,7 @@ func loadMaintenanceIssuesFromJSONL(beadsDir string) ([]*types.Issue, error) {
 }
 
 func loadMisclassifiedWispIssues(path string) ([]*types.Issue, error) {
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	issues, err := loadMisclassifiedWispIssuesFromDatabase(beadsDir)
 	if err == nil {

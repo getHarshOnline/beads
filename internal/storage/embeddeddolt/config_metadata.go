@@ -1,27 +1,24 @@
-//go:build embeddeddolt
+//go:build cgo
 
 package embeddeddolt
 
 import (
 	"context"
 	"database/sql"
-	"errors"
-	"fmt"
-	"strings"
 
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/domain"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 func (s *EmbeddedDoltStore) SetConfig(ctx context.Context, key, value string) error {
-	// Normalize issue_prefix: strip trailing hyphen to avoid double-hyphen IDs,
-	// matching DoltStore behavior.
-	if key == "issue_prefix" {
-		value = strings.TrimSuffix(value, "-")
-	}
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, "REPLACE INTO config (`key`, value) VALUES (?, ?)", key, value)
+		if err := issueops.SetConfigInTx(ctx, tx, key, value); err != nil {
+			return err
+		}
+		// Sync normalized tables when config keys change
+		_, err := issueops.SyncConfigTables(ctx, tx, key, value)
 		return err
 	})
 }
@@ -29,90 +26,75 @@ func (s *EmbeddedDoltStore) SetConfig(ctx context.Context, key, value string) er
 func (s *EmbeddedDoltStore) GetConfig(ctx context.Context, key string) (string, error) {
 	var value string
 	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, "SELECT value FROM config WHERE `key` = ?", key).Scan(&value)
+		var err error
+		value, err = issueops.GetConfigInTx(ctx, tx, key)
+		return err
 	})
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", nil
-		}
-		return "", fmt.Errorf("embeddeddolt: get config %q: %w", key, err)
-	}
-	return value, nil
+	return value, err
 }
 
 func (s *EmbeddedDoltStore) GetAllConfig(ctx context.Context) (map[string]string, error) {
-	result := make(map[string]string)
+	var result map[string]string
 	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
-		rows, err := tx.QueryContext(ctx, "SELECT `key`, value FROM config")
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var k, v string
-			if err := rows.Scan(&k, &v); err != nil {
-				return err
-			}
-			result[k] = v
-		}
-		return rows.Err()
+		var err error
+		result, err = issueops.GetAllConfigInTx(ctx, tx)
+		return err
 	})
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
+	return result, err
 }
 
 func (s *EmbeddedDoltStore) GetMetadata(ctx context.Context, key string) (string, error) {
 	var value string
 	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx, "SELECT value FROM metadata WHERE `key` = ?", key).Scan(&value)
+		var err error
+		value, err = issueops.GetMetadataInTx(ctx, tx, key)
+		return err
 	})
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", nil
-		}
-		return "", fmt.Errorf("GetMetadata(%q): %w", key, err)
-	}
-	return value, nil
+	return value, err
 }
 
 func (s *EmbeddedDoltStore) SetMetadata(ctx context.Context, key, value string) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, "REPLACE INTO metadata (`key`, value) VALUES (?, ?)", key, value)
+		return issueops.SetMetadataInTx(ctx, tx, key, value)
+	})
+}
+
+func (s *EmbeddedDoltStore) SetLocalMetadata(ctx context.Context, key, value string) error {
+	return s.withConn(ctx, true, func(tx *sql.Tx) error {
+		return issueops.SetLocalMetadataInTx(ctx, tx, key, value)
+	})
+}
+
+func (s *EmbeddedDoltStore) GetLocalMetadata(ctx context.Context, key string) (string, error) {
+	var value string
+	err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		var err error
+		value, err = issueops.GetLocalMetadataInTx(ctx, tx, key)
 		return err
 	})
+	return value, err
 }
 
 // GetInfraTypes returns the set of infrastructure types that should be routed
 // to the wisps table. Reads from DB config "types.infra", falls back to YAML,
-// then to hardcoded defaults (agent, rig, role, message).
+// then to hardcoded defaults (agent, role, message).
 func (s *EmbeddedDoltStore) GetInfraTypes(ctx context.Context) map[string]bool {
-	var typeList []string
-
-	value, err := s.GetConfig(ctx, "types.infra")
-	if err == nil && value != "" {
-		for _, t := range strings.Split(value, ",") {
-			t = strings.TrimSpace(t)
-			if t != "" {
-				typeList = append(typeList, t)
-			}
-		}
-	}
-
-	if len(typeList) == 0 {
+	var result map[string]bool
+	if err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		result = issueops.ResolveInfraTypesInTx(ctx, tx)
+		return nil
+	}); err != nil || result == nil {
+		// DB unavailable — fall back to YAML then defaults.
+		var typeList []string
 		if yamlTypes := config.GetInfraTypesFromYAML(); len(yamlTypes) > 0 {
 			typeList = yamlTypes
+		} else {
+			typeList = domain.DefaultInfraTypes()
 		}
-	}
-
-	if len(typeList) == 0 {
-		typeList = dolt.DefaultInfraTypes()
-	}
-
-	result := make(map[string]bool, len(typeList))
-	for _, t := range typeList {
-		result[t] = true
+		result = make(map[string]bool, len(typeList))
+		for _, t := range typeList {
+			result[t] = true
+		}
 	}
 	return result
 }

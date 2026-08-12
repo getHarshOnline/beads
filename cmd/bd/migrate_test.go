@@ -16,6 +16,28 @@ import (
 
 // TestFormatDBList removed: formatDBList and dbInfo types were removed.
 
+func TestMigrateSchemaFlagBoundaries(t *testing.T) {
+	// Registration only: strict subprocess tests use the unique root persistent
+	// --format=json alias because duplicate local --json registration can shadow
+	// whether PersistentPreRunE sees the root flag as explicitly set.
+	for _, name := range []string{"inspect", "dry-run"} {
+		if flag := migrateSchemaCmd.Flags().Lookup(name); flag != nil {
+			t.Errorf("migrate schema unexpectedly registers local --%s", name)
+		}
+	}
+	for _, name := range []string{"json", "force"} {
+		if flag := migrateSchemaCmd.Flags().Lookup(name); flag == nil {
+			t.Errorf("migrate schema must register local --%s", name)
+		}
+	}
+	if flag := rootCmd.PersistentFlags().Lookup("json"); flag == nil {
+		t.Error("root command must register persistent --json")
+	}
+	if flag := rootCmd.PersistentFlags().Lookup("format"); flag == nil {
+		t.Error("root command must register persistent --format")
+	}
+}
+
 func TestMigrateRespectsConfigJSON(t *testing.T) {
 	t.Skip("SQLite-specific: Dolt backend always uses 'dolt' directory, not custom database filenames")
 	// Test that migrate respects custom database name from metadata.json
@@ -39,7 +61,7 @@ func TestMigrateRespectsConfigJSON(t *testing.T) {
 		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	ctx := context.Background()
-	if err := store.SetMetadata(ctx, "bd_version", "0.21.1"); err != nil {
+	if err := store.SetLocalMetadata(ctx, "bd_version", "0.21.1"); err != nil {
 		t.Fatalf("Failed to set version: %v", err)
 	}
 	_ = store.Close()

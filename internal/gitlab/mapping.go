@@ -13,7 +13,6 @@ type MappingConfig struct {
 	PriorityMap  map[string]int    // priority label value → beads priority (0-4)
 	StateMap     map[string]string // GitLab state → beads status
 	LabelTypeMap map[string]string // type label value → beads issue type
-	RelationMap  map[string]string // GitLab link type → beads dependency type
 }
 
 // DefaultMappingConfig returns the default mapping configuration.
@@ -41,11 +40,6 @@ func DefaultMappingConfig() *MappingConfig {
 			"reopened": StatusMapping["open"], // reopened maps to open
 		},
 		LabelTypeMap: labelTypeMap,
-		RelationMap: map[string]string{
-			"blocks":        "blocks",
-			"is_blocked_by": "blocked_by",
-			"relates_to":    "related",
-		},
 	}
 }
 
@@ -76,14 +70,17 @@ func statusFromLabelsAndState(labels []string, state string, config *MappingConf
 		prefix, value := parseLabelPrefix(label)
 		if prefix == "status" {
 			normalized := strings.ToLower(value)
-			if normalized == "in_progress" {
+			switch normalized {
+			case "open":
+				return "open"
+			case "in_progress":
 				return "in_progress"
-			}
-			if normalized == "blocked" {
+			case "blocked":
 				return "blocked"
-			}
-			if normalized == "deferred" {
+			case "deferred":
 				return "deferred"
+			case "done":
+				return "closed"
 			}
 		}
 	}
@@ -151,9 +148,12 @@ func GitLabIssueToBeads(gl *Issue, config *MappingConfig) *IssueConversion {
 		issue.UpdatedAt = *gl.UpdatedAt
 	}
 
+	// Convert issue links to dependencies if available.
+	deps := issueLinksToDependencies(gl.IID, gl.IssueLinksData, config)
+
 	return &IssueConversion{
 		Issue:        issue,
-		Dependencies: []DependencyInfo{},
+		Dependencies: deps,
 	}
 }
 
@@ -178,7 +178,7 @@ func BeadsIssueToGitLabFields(issue *types.Issue, config *MappingConfig) map[str
 		labels = append(labels, "priority::"+priorityLabel)
 	}
 
-	// Add status label (if not open or closed - those are handled by state)
+	// Add status label (if not open or closed - those are handled by GitLab state)
 	if issue.Status == types.StatusInProgress {
 		labels = append(labels, "status::in_progress")
 	} else if issue.Status == types.StatusBlocked {
@@ -197,9 +197,14 @@ func BeadsIssueToGitLabFields(issue *types.Issue, config *MappingConfig) map[str
 		fields["weight"] = *issue.EstimatedMinutes / 60
 	}
 
-	// Set state_event for closed issues
+	// Set state_event so the GitLab issue state tracks the bead. On update this
+	// closes or reopens the issue; on create GitLab's POST /issues ignores
+	// state_event, so a closed bead is created open and closed by a follow-up
+	// update in Tracker.CreateIssue.
 	if issue.Status == types.StatusClosed {
 		fields["state_event"] = "close"
+	} else {
+		fields["state_event"] = "reopen"
 	}
 
 	return fields
@@ -221,44 +226,6 @@ func priorityToLabel(priority int) string {
 	default:
 		return "medium"
 	}
-}
-
-// issueLinksToDependencies converts GitLab IssueLinks to beads DependencyInfo.
-func issueLinksToDependencies(sourceIID int, links []IssueLink, config *MappingConfig) []DependencyInfo {
-	var deps []DependencyInfo
-
-	for _, link := range links {
-		var toIID int
-		var depType string
-
-		// Determine direction and target
-		if link.SourceIssue != nil && link.SourceIssue.IID == sourceIID {
-			// We are the source, target is the dependency
-			if link.TargetIssue != nil {
-				toIID = link.TargetIssue.IID
-			}
-		} else if link.TargetIssue != nil && link.TargetIssue.IID == sourceIID {
-			// We are the target, source is the dependency
-			if link.SourceIssue != nil {
-				toIID = link.SourceIssue.IID
-			}
-		}
-
-		// Map link type
-		if t, ok := config.RelationMap[link.LinkType]; ok {
-			depType = t
-		} else {
-			depType = "related"
-		}
-
-		deps = append(deps, DependencyInfo{
-			FromGitLabIID: sourceIID,
-			ToGitLabIID:   toIID,
-			Type:          depType,
-		})
-	}
-
-	return deps
 }
 
 // filterNonScopedLabels returns only labels without scoped prefixes.

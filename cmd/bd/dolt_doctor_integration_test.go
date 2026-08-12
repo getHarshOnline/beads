@@ -11,9 +11,6 @@ import (
 )
 
 func TestDoltDoctor_NoSQLiteWarningsAfterInitAndCreate(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow integration test in short mode")
-	}
 	if runtime.GOOS == windowsOS {
 		t.Skip("dolt doctor integration test not supported on windows")
 	}
@@ -27,9 +24,11 @@ func TestDoltDoctor_NoSQLiteWarningsAfterInitAndCreate(t *testing.T) {
 	_ = runCommandInDir(tmpDir, "git", "config", "user.email", "test@example.com")
 	_ = runCommandInDir(tmpDir, "git", "config", "user.name", "Test User")
 
-	env := []string{
-		"BEADS_TEST_MODE=1",
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
 	}
+
+	env := append(os.Environ(), "BEADS_TEST_MODE=1")
 
 	// Init dolt backend.
 	initOut, initErr := runBDExecAllowErrorWithEnv(t, tmpDir, env, "init", "--backend", "dolt", "--prefix", "test", "--quiet")

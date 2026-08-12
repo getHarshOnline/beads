@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/testutil"
 )
@@ -56,6 +57,10 @@ func TestMain(m *testing.M) {
 
 func testMainInner(m *testing.M) int {
 	os.Setenv("BEADS_TEST_MODE", "1")
+	// AD-01 (be-c5p): doctor e2e tests connect to a per-package test server.
+	// The dolt.New database-name firewall requires this opt-in to allow
+	// doctor_pkg_shared and doctest_*-prefixed databases through.
+	os.Setenv("BEADS_TEST_SERVER", "1")
 	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
 		fmt.Fprintf(os.Stderr, "WARN: %v, skipping Dolt tests\n", err)
 	} else {
@@ -80,6 +85,11 @@ func testMainInner(m *testing.M) int {
 	}
 
 	code := m.Run()
+
+	// Best-effort reap of any dolt sql-server left running under a temp dir
+	// this suite created (e.g. a SIGKILLed run) — see
+	// gastownhall/beads mybd-q6cz.
+	doltserver.SweepOrphanedTestServers(testBDDir)
 
 	os.Unsetenv("BEADS_DOLT_PORT")
 	os.Unsetenv("BEADS_TEST_MODE")
@@ -119,6 +129,9 @@ func initDoctorSharedSchema(port int) error {
 	if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('--allow-empty', '-m', 'test: init shared schema')"); err != nil {
 		return fmt.Errorf("DOLT_COMMIT: %w", err)
 	}
+	if err := testutil.MaterializeLocalTableSchemasForBranchTests(ctx, db); err != nil {
+		return fmt.Errorf("materialize local table schemas: %w", err)
+	}
 
 	return nil
 }
@@ -145,7 +158,7 @@ func buildTestBD(t *testing.T) string {
 
 		// Build from cmd/bd relative to the module root.
 		// The test runs from cmd/bd/doctor/, so module root is ../../../
-		cmd := exec.Command("go", "build", "-o", testBDPath, "./cmd/bd")
+		cmd := exec.Command("go", "build", "-tags", "gms_pure_go", "-o", testBDPath, "./cmd/bd")
 
 		// Find the module root by looking for go.mod
 		modRoot := findModuleRoot(t)
@@ -265,7 +278,7 @@ func runBDDoctor(t *testing.T, bdPath, path string) (e2eDoctorResult, string, er
 	return result, string(out), execErr
 }
 
-// TestE2E_DoctorSQLiteBackend was removed: SQLite backend no longer exists.
+// TestE2E_DoctorSQLiteBackend is covered by the backend-neutral doctor tests.
 // GetBackend() always returns "dolt" after the dolt-native cleanup (bd-yqpwy).
 
 // TestE2E_DoctorDoltBackendNoDB was removed: the embedded Dolt driver

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"os"
 	"sync"
 	"text/template"
 	"time"
@@ -35,6 +34,8 @@ var errAPIKeyRequired = errors.New("API key required")
 type haikuClient struct {
 	client         anthropic.Client
 	model          anthropic.Model
+	apiKeySource   config.AIAPIKeySource
+	baseURL        string
 	tier1Template  *template.Template
 	maxRetries     int
 	initialBackoff time.Duration
@@ -43,19 +44,20 @@ type haikuClient struct {
 }
 
 // newHaikuClient creates a new Haiku API client.
-// API key resolution order: ANTHROPIC_API_KEY env var > ai.api_key config > explicit apiKey parameter.
+// API key resolution order: ANTHROPIC_API_KEY env var > MINIMAX_API_KEY env var > ai.api_key config > explicit apiKey parameter.
 func newHaikuClient(apiKey string) (*haikuClient, error) {
-	envKey := os.Getenv("ANTHROPIC_API_KEY")
-	if envKey != "" {
-		apiKey = envKey
-	} else if configKey := config.GetString("ai.api_key"); configKey != "" {
-		apiKey = configKey
-	}
+	apiKey, keySource := config.ResolveAIAPIKey(apiKey)
 	if apiKey == "" {
-		return nil, fmt.Errorf("%w: set ANTHROPIC_API_KEY environment variable or ai.api_key in config", errAPIKeyRequired)
+		return nil, fmt.Errorf("%w: set ANTHROPIC_API_KEY, MINIMAX_API_KEY, or ai.api_key in config", errAPIKeyRequired)
 	}
 
-	client := anthropic.NewClient(option.WithAPIKey(apiKey))
+	clientOptions := []option.RequestOption{option.WithAPIKey(apiKey)}
+	baseURL := config.DefaultAIBaseURL(keySource)
+	if baseURL != "" {
+		clientOptions = append(clientOptions, option.WithBaseURL(baseURL))
+	}
+
+	client := anthropic.NewClient(clientOptions...)
 
 	tier1Tmpl, err := template.New("tier1").Parse(tier1PromptTemplate)
 	if err != nil {
@@ -66,7 +68,9 @@ func newHaikuClient(apiKey string) (*haikuClient, error) {
 
 	return &haikuClient{
 		client:         client,
-		model:          anthropic.Model(config.DefaultAIModel()),
+		model:          config.DefaultAIModelFor(keySource),
+		apiKeySource:   keySource,
+		baseURL:        baseURL,
 		tier1Template:  tier1Tmpl,
 		maxRetries:     maxRetries,
 		initialBackoff: initialBackoff,
@@ -87,7 +91,7 @@ func (h *haikuClient) SummarizeTier1(ctx context.Context, issue *types.Issue) (s
 			Kind:     "llm_call",
 			Actor:    h.auditActor,
 			IssueID:  issue.ID,
-			Model:    string(h.model),
+			Model:    h.model,
 			Prompt:   prompt,
 			Response: resp,
 		}
@@ -129,7 +133,7 @@ func (h *haikuClient) callWithRetry(ctx context.Context, prompt string) (string,
 	ctx, span := tracer.Start(ctx, "anthropic.messages.new")
 	defer span.End()
 	span.SetAttributes(
-		attribute.String("bd.ai.model", string(h.model)),
+		attribute.String("bd.ai.model", h.model),
 		attribute.String("bd.ai.operation", "compact"),
 	)
 
@@ -158,7 +162,7 @@ func (h *haikuClient) callWithRetry(ctx context.Context, prompt string) (string,
 
 		if err == nil {
 			// Record token usage and latency.
-			modelAttr := attribute.String("bd.ai.model", string(h.model))
+			modelAttr := attribute.String("bd.ai.model", h.model)
 			if aiMetrics.inputTokens != nil {
 				aiMetrics.inputTokens.Add(ctx, message.Usage.InputTokens, metric.WithAttributes(modelAttr))
 				aiMetrics.outputTokens.Add(ctx, message.Usage.OutputTokens, metric.WithAttributes(modelAttr))

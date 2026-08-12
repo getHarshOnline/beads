@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/steveyegge/beads/internal/beads"
@@ -37,11 +36,11 @@ func readLineUnbuffered() (string, error) {
 
 // updateRepoIDInProcess updates the repo_id metadata directly in the Dolt store,
 // avoiding subprocess lock contention. (GH#1805)
-func updateRepoIDInProcess(beadsDir string, autoYes bool) error {
+func updateRepoIDInProcess(path string, beadsDir string, autoYes bool) error {
 	ctx := context.Background()
 
 	// Compute new repo ID
-	newRepoID, err := beads.ComputeRepoID()
+	newRepoID, err := beads.ComputeRepoIDForPath(path)
 	if err != nil {
 		return fmt.Errorf("failed to compute repository ID: %w", err)
 	}
@@ -101,17 +100,15 @@ func updateRepoIDInProcess(beadsDir string, autoYes bool) error {
 // All operations are performed in-process to avoid Dolt lock contention
 // that occurs when spawning bd subcommands. (GH#1805)
 func RepoFingerprint(path string, autoYes bool) error {
-	// Validate workspace
-	if err := validateBeadsWorkspace(path); err != nil {
+	beadsDir, err := resolvedWorkspaceBeadsDir(path)
+	if err != nil {
 		return err
 	}
-
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
 
 	// In --yes mode, auto-select the recommended safe action [1].
 	if autoYes {
 		fmt.Println("  → Auto mode (--yes): updating repo ID in-process...")
-		return updateRepoIDInProcess(beadsDir, true)
+		return updateRepoIDInProcess(path, beadsDir, true)
 	}
 
 	// Prompt user for action
@@ -133,7 +130,7 @@ func RepoFingerprint(path string, autoYes bool) error {
 
 	switch response {
 	case "1":
-		return updateRepoIDInProcess(beadsDir, false)
+		return updateRepoIDInProcess(path, beadsDir, false)
 
 	case "2":
 		// Detect backend to determine what to remove

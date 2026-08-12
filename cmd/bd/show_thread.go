@@ -8,24 +8,23 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
 // showMessageThread displays a full conversation thread for a message
-func showMessageThread(ctx context.Context, messageID string, jsonOutput bool) {
-	// Get the starting message
+func showMessageThread(ctx context.Context, messageID string, jsonOutput bool) error {
 	var startMsg *types.Issue
 	var err error
 
 	startMsg, err = store.GetIssue(ctx, messageID)
 	if err != nil {
-		FatalError("fetching message %s: %v", messageID, err)
+		return HandleError("fetching message %s: %v", messageID, err)
 	}
 
 	if startMsg == nil {
-		FatalError("message %s not found", messageID)
+		return HandleError("message %s not found", messageID)
 	}
 
 	// Find the root of the thread by following replies-to dependencies upward
@@ -88,8 +87,7 @@ func showMessageThread(ctx context.Context, messageID string, jsonOutput bool) {
 	if jsonOutput {
 		encoder := json.NewEncoder(os.Stdout)
 		encoder.SetIndent("", "  ")
-		_ = encoder.Encode(threadMessages)
-		return
+		return encoder.Encode(threadMessages)
 	}
 
 	// Display the thread
@@ -132,11 +130,12 @@ func showMessageThread(ctx context.Context, messageID string, jsonOutput bool) {
 	}
 
 	fmt.Printf("Total: %d messages in thread\n\n", len(threadMessages))
+	return nil
 }
 
 // findRepliesTo finds the parent ID that this issue replies to via replies-to dependency.
 // Returns empty string if no parent found.
-func findRepliesTo(ctx context.Context, issueID string, store *dolt.DoltStore) string {
+func findRepliesTo(ctx context.Context, issueID string, store storage.DoltStorage) string {
 	deps, err := store.GetDependencyRecords(ctx, issueID)
 	if err != nil {
 		return ""
@@ -150,7 +149,7 @@ func findRepliesTo(ctx context.Context, issueID string, store *dolt.DoltStore) s
 }
 
 // findReplies finds all issues that reply to this issue via replies-to dependency.
-func findReplies(ctx context.Context, issueID string, store *dolt.DoltStore) []*types.Issue {
+func findReplies(ctx context.Context, issueID string, store storage.DoltStorage) []*types.Issue {
 	deps, err := store.GetDependentsWithMetadata(ctx, issueID)
 	if err != nil {
 		return nil

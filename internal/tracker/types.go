@@ -44,6 +44,12 @@ type TrackerIssue struct {
 	ParentID         string // Parent issue identifier (for subtasks/children)
 	ParentInternalID string // Parent issue internal ID
 
+	// Warnings carries non-fatal, partial-success messages from a create/update
+	// (e.g. the issue was created but a follow-up state change failed). The sync
+	// engine drains these into the sync result's warnings so a degraded push is
+	// visible in --json output instead of being silently swallowed.
+	Warnings []string
+
 	// Raw data for tracker-specific processing
 	Raw interface{} // Original API response for tracker-specific access
 
@@ -82,17 +88,41 @@ type SyncOptions struct {
 	TypeFilter []types.IssueType
 	// ExcludeTypes excludes specific issue types from sync.
 	ExcludeTypes []types.IssueType
+	// ExcludeIDPrefix skips issues whose ID starts with this prefix (case-
+	// sensitive). Used to filter workflow-artifact beads (e.g. "hw-mol-")
+	// from external sync. Empty means no prefix filter.
+	ExcludeIDPrefix string
+	// ExcludeIDPatterns skips issues whose ID contains any of these
+	// substrings (case-sensitive, anywhere in the ID). Empty means no
+	// pattern filter. Combined with ExcludeIDPrefix as a union (matches
+	// either rule → excluded).
+	ExcludeIDPatterns []string
 	// ExcludeEphemeral skips ephemeral/wisp issues from push (default behavior in CLI).
 	ExcludeEphemeral bool
+	// ParentID limits push to this beads issue and all its descendants via
+	// parent-child dependencies. Empty means no restriction.
+	ParentID string
+	// IssueIDs restricts sync to only these issues. Accepts bead IDs (e.g. "bd-123")
+	// or external refs (e.g. "EXT-456"). When non-empty, push filters local issues
+	// by ID and pull uses FetchIssue() for targeted retrieval instead of bulk fetch.
+	IssueIDs []string
+	// DependencyTypes limits which dependency types pull creates from tracker
+	// mapper output. Empty means all dependency types are created.
+	DependencyTypes []types.DependencyType
+	// DependencySources limits which dependency sources pull creates from tracker
+	// mapper output. Empty means all dependency sources are created.
+	DependencySources []DependencySource
 }
 
 // SyncResult is the complete result of a sync operation.
 type SyncResult struct {
-	Success  bool      `json:"success"`
-	Stats    SyncStats `json:"stats"`
-	LastSync string    `json:"last_sync,omitempty"` // RFC3339 timestamp
-	Error    string    `json:"error,omitempty"`
-	Warnings []string  `json:"warnings,omitempty"`
+	Success   bool      `json:"success"`
+	Stats     SyncStats `json:"stats"`
+	LastSync  string    `json:"last_sync,omitempty"` // RFC3339 timestamp
+	Error     string    `json:"error,omitempty"`
+	Warnings  []string  `json:"warnings,omitempty"`
+	PullStats PullStats `json:"-"`
+	PushStats PushStats `json:"-"`
 }
 
 // SyncStats accumulates sync statistics.
@@ -108,19 +138,44 @@ type SyncStats struct {
 
 // PullStats tracks pull operation results.
 type PullStats struct {
+	Queried     int
+	Candidates  int
 	Created     int
 	Updated     int
 	Skipped     int
+	Errors      int
 	Incremental bool
 	SyncedSince string
 }
 
 // PushStats tracks push operation results.
 type PushStats struct {
-	Created int
-	Updated int
-	Skipped int
-	Errors  int
+	Created  int
+	Updated  int
+	Skipped  int
+	Errors   int
+	Warnings []string
+}
+
+// BatchPushItem describes one local issue handled by a tracker batch push.
+type BatchPushItem struct {
+	LocalID     string
+	ExternalRef string
+}
+
+// BatchPushError describes one issue-level failure from a tracker batch push.
+type BatchPushError struct {
+	LocalID string
+	Message string
+}
+
+// BatchPushResult is the normalized result of a tracker batch push.
+type BatchPushResult struct {
+	Created  []BatchPushItem
+	Updated  []BatchPushItem
+	Skipped  []string
+	Errors   []BatchPushError
+	Warnings []string
 }
 
 // Conflict represents a bidirectional modification conflict.
@@ -156,4 +211,13 @@ type DependencyInfo struct {
 	FromExternalID string // External identifier of the dependent issue
 	ToExternalID   string // External identifier of the dependency target
 	Type           string // Beads dependency type (blocks, related, duplicates, parent-child)
+	Source         DependencySource
 }
+
+// DependencySource identifies which tracker relationship produced a dependency.
+type DependencySource string
+
+const (
+	DependencySourceParent   DependencySource = "parent"
+	DependencySourceRelation DependencySource = "relation"
+)

@@ -30,12 +30,10 @@ func DatabaseVersion(path string) error {
 // DatabaseVersionWithBdVersion is like DatabaseVersion but accepts an explicit
 // bd version string for setting the bd_version metadata field.
 func DatabaseVersionWithBdVersion(path string, bdVersion string) error {
-	// Validate workspace
-	if err := validateBeadsWorkspace(path); err != nil {
+	beadsDir, err := resolvedWorkspaceBeadsDir(path)
+	if err != nil {
 		return err
 	}
-
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
 
 	// Load or create config
 	cfg, err := configfile.Load(beadsDir)
@@ -52,10 +50,15 @@ func DatabaseVersionWithBdVersion(path string, bdVersion string) error {
 	ctx := context.Background()
 
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		// No database - create a new Dolt store
+		// No database - create a new Dolt store. Creation is this branch's
+		// explicit purpose, so opt out of the dolt.New create-guard
+		// (bd-kjfsq: without CreateIfMissing the guard fails the fix with
+		// "database not found" on exactly the fresh clones it exists for).
 		fmt.Println("  → No database found, creating Dolt store...")
 
-		store, err := dolt.NewFromConfig(ctx, beadsDir)
+		// Bead-mutating: the branch below imports every issue in the JSONL, so
+		// it opens through the activating factory and those creates journal.
+		store, err := openBeadMutatingStoreCreating(ctx, beadsDir)
 		if err != nil {
 			return fmt.Errorf("failed to create database: %w", err)
 		}
@@ -69,7 +72,7 @@ func DatabaseVersionWithBdVersion(path string, bdVersion string) error {
 
 		// Set version metadata if provided
 		if bdVersion != "" {
-			if err := store.SetMetadata(ctx, "bd_version", bdVersion); err != nil {
+			if err := store.SetLocalMetadata(ctx, "bd_version", bdVersion); err != nil {
 				fmt.Printf("  Warning: failed to set bd_version: %v\n", err)
 			}
 		}
@@ -101,9 +104,9 @@ func DatabaseVersionWithBdVersion(path string, bdVersion string) error {
 	}
 	defer func() { _ = store.Close() }()
 
-	// Update bd_version if provided
+	// Update bd_version if provided (clone-local, dolt-ignored)
 	if bdVersion != "" {
-		if err := store.SetMetadata(ctx, "bd_version", bdVersion); err != nil {
+		if err := store.SetLocalMetadata(ctx, "bd_version", bdVersion); err != nil {
 			return fmt.Errorf("failed to set bd_version: %w", err)
 		}
 	}
@@ -137,11 +140,10 @@ func SchemaCompatibility(path string) error {
 // existing (possibly empty) Dolt store. This covers the case where the Database
 // fix already created the store but a prior version didn't import.
 func FreshCloneImport(path string, bdVersion string) error {
-	if err := validateBeadsWorkspace(path); err != nil {
+	beadsDir, err := resolvedWorkspaceBeadsDir(path)
+	if err != nil {
 		return err
 	}
-
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
 
 	// Check for JSONL file
 	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
@@ -156,9 +158,11 @@ func FreshCloneImport(path string, bdVersion string) error {
 		return DatabaseVersionWithBdVersion(path, bdVersion)
 	}
 
-	// Dolt store exists — check if it already has issues
+	// Dolt store exists — check if it already has issues. Bead-mutating: an
+	// empty store is imported into below, so it opens through the activating
+	// factory and those creates journal.
 	ctx := context.Background()
-	store, err := dolt.NewFromConfig(ctx, beadsDir)
+	store, err := openBeadMutatingStore(ctx, beadsDir)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
@@ -181,7 +185,7 @@ func FreshCloneImport(path string, bdVersion string) error {
 
 // importJSONLIntoStore reads a JSONL file and imports all issues into the Dolt store.
 // Used by both the Database fix (new store creation) and Fresh Clone fix (empty store).
-func importJSONLIntoStore(ctx context.Context, store *dolt.DoltStore, jsonlPath string) (int, error) {
+func importJSONLIntoStore(ctx context.Context, store storage.DoltStorage, jsonlPath string) (int, error) {
 	f, err := os.Open(jsonlPath) // #nosec G304 - workspace-controlled path
 	if err != nil {
 		return 0, fmt.Errorf("failed to open JSONL file: %w", err)
@@ -229,7 +233,6 @@ func importJSONLIntoStore(ctx context.Context, store *dolt.DoltStore, jsonlPath 
 	actor := detectActor()
 
 	err = store.CreateIssuesWithFullOptions(ctx, issues, actor, storage.BatchCreateOptions{
-		OrphanHandling:       storage.OrphanAllow,
 		SkipPrefixValidation: true,
 	})
 	if err != nil {
@@ -241,11 +244,11 @@ func importJSONLIntoStore(ctx context.Context, store *dolt.DoltStore, jsonlPath 
 
 // detectActor returns the best available actor name for automated operations.
 func detectActor() string {
-	if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
-		return bdActor
-	}
 	if beadsActor := os.Getenv("BEADS_ACTOR"); beadsActor != "" {
 		return beadsActor
+	}
+	if bdActor := os.Getenv("BD_ACTOR"); bdActor != "" {
+		return bdActor
 	}
 	if out, err := exec.Command("git", "config", "user.name").Output(); err == nil {
 		if gitUser := strings.TrimSpace(string(out)); gitUser != "" {

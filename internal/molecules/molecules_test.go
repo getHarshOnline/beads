@@ -32,12 +32,6 @@ func newTestMoleculeStore(t *testing.T) *dolt.DoltStore {
 
 	_, branchCleanup := testutil.StartTestBranch(t, store.DB(), testSharedDB)
 
-	if err := dolt.CreateIgnoredTables(store.DB()); err != nil {
-		branchCleanup()
-		store.Close()
-		t.Fatalf("CreateIgnoredTables failed: %v", err)
-	}
-
 	t.Cleanup(func() {
 		branchCleanup()
 		store.Close()
@@ -169,7 +163,7 @@ func TestLoader_SkipExistingMolecules(t *testing.T) {
 		Status:     types.StatusOpen,
 		IsTemplate: true,
 	}
-	opts := storage.BatchCreateOptions{SkipPrefixValidation: true, OrphanHandling: storage.OrphanAllow}
+	opts := storage.BatchCreateOptions{SkipPrefixValidation: true}
 	if err := store.CreateIssuesWithFullOptions(ctx, []*types.Issue{existingMol}, "test", opts); err != nil {
 		t.Fatalf("Failed to create existing molecule: %v", err)
 	}

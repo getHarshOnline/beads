@@ -16,7 +16,7 @@ import (
 
 // CheckInstallation verifies that .beads directory exists
 func CheckInstallation(path string) DoctorCheck {
-	beadsDir := filepath.Join(path, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(path)
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
 		// Auto-detect prefix from directory name
 		prefix := filepath.Base(path)
@@ -37,10 +37,10 @@ func CheckInstallation(path string) DoctorCheck {
 	}
 }
 
-// CheckPermissions verifies that .beads directory and database are readable/writable
+// CheckPermissions verifies that .beads directory and database are readable/writable.
+// Opens its own store; prefer CheckPermissionsWithStore when a shared store is available.
 func CheckPermissions(path string) DoctorCheck {
-	// Follow redirect to resolve actual beads directory (bd-tvus fix)
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
 	// Check if .beads/ is writable
 	testFile := filepath.Join(beadsDir, ".doctor-test-write")
@@ -69,7 +69,7 @@ func CheckPermissions(path string) DoctorCheck {
 			}
 			// Try to open Dolt store read-only to verify accessibility
 			ctx := context.Background()
-			store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
+			store, err := dolt.NewFromConfigWithCLIOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 			if err != nil {
 				return DoctorCheck{
 					Name:    "Permissions",
@@ -80,6 +80,73 @@ func CheckPermissions(path string) DoctorCheck {
 				}
 			}
 			_ = store.Close()
+		}
+	}
+
+	return DoctorCheck{
+		Name:    "Permissions",
+		Status:  StatusOK,
+		Message: "All permissions OK",
+	}
+}
+
+// CheckPermissionsWithStore verifies permissions using a shared store (GH#2636).
+// If the shared store was opened successfully, the database is accessible.
+func CheckPermissionsWithStore(path string, ss *SharedStore) DoctorCheck {
+	beadsDir := beadsDirFromSharedStore(path, ss)
+	store := ss.Store()
+
+	// Check if .beads/ is writable
+	testFile := filepath.Join(beadsDir, ".doctor-test-write")
+	if err := os.WriteFile(testFile, []byte("test"), 0600); err != nil {
+		return DoctorCheck{
+			Name:    "Permissions",
+			Status:  StatusError,
+			Message: ".beads/ directory is not writable",
+			Fix:     "Run 'bd doctor --fix' to fix permissions",
+		}
+	}
+	_ = os.Remove(testFile)
+
+	// Check Dolt database directory permissions
+	cfg, err := configfile.Load(beadsDir)
+	if err == nil && cfg != nil && cfg.GetBackend() == configfile.BackendDolt {
+		if cfg.IsDoltServerMode() {
+			if store == nil {
+				return DoctorCheck{
+					Name:    "Permissions",
+					Status:  StatusError,
+					Message: "Unable to verify Dolt server-backed database permissions",
+					Fix:     "Check 'bd dolt status' for server availability, then re-run 'bd doctor'",
+				}
+			}
+			return DoctorCheck{
+				Name:    "Permissions",
+				Status:  StatusOK,
+				Message: "All permissions OK",
+			}
+		}
+
+		doltPath := getDatabasePath(beadsDir)
+		if info, err := os.Stat(doltPath); err == nil {
+			if !info.IsDir() {
+				return DoctorCheck{
+					Name:    "Permissions",
+					Status:  StatusError,
+					Message: "dolt/ is not a directory",
+					Fix:     "Run 'bd doctor --fix' to fix permissions",
+				}
+			}
+			// If shared store is nil, the database could not be opened
+			if store == nil {
+				return DoctorCheck{
+					Name:    "Permissions",
+					Status:  StatusError,
+					Message: "Dolt database exists but cannot be opened",
+					Fix:     "Run 'bd doctor --fix' to fix permissions",
+				}
+			}
+			// Shared store was opened successfully — database is accessible
 		}
 	}
 
@@ -106,7 +173,8 @@ func CheckUntrackedBeadsFiles(path string) DoctorCheck {
 		}
 	}
 
-	beadsDir := filepath.Join(path, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(path)
+	repoRoot := resolvedBeadsRepoRoot(path)
 
 	// Skip if .beads doesn't exist
 	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
@@ -129,7 +197,7 @@ func CheckUntrackedBeadsFiles(path string) DoctorCheck {
 
 	// Run git status --porcelain to find untracked files in .beads/
 	cmd := exec.Command("git", "status", "--porcelain", ".beads/")
-	cmd.Dir = path
+	cmd.Dir = repoRoot
 	output, err := cmd.Output()
 	if err != nil {
 		return DoctorCheck{

@@ -1,4 +1,4 @@
-//go:build embeddeddolt
+//go:build cgo
 
 package embeddeddolt_test
 
@@ -60,20 +60,33 @@ func TestConcurrencyMultiProcess(t *testing.T) {
 	t.Log("init complete")
 
 	// Build the test binary that subprocesses will exec.
-	testBin := filepath.Join(t.TempDir(), "embeddeddolt.test")
-	t.Logf("building test binary: go test -tags embeddeddolt -c -o %s ./internal/storage/embeddeddolt/", testBin)
-	build := exec.CommandContext(ctx, "go", "test",
-		"-tags", "embeddeddolt",
-		"-c",
-		"-o", testBin,
-		"./internal/storage/embeddeddolt/",
-	)
-	build.Dir = modRoot
-	build.Env = append(os.Environ(), "CGO_ENABLED=1")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build test binary: %v\n%s", err, string(out))
+	// If BEADS_TEST_EMBEDDED_TEST_BINARY is set, skip the build.
+	testBin := os.Getenv("BEADS_TEST_EMBEDDED_TEST_BINARY")
+	if testBin != "" {
+		if _, err := os.Stat(testBin); err != nil {
+			t.Fatalf("BEADS_TEST_EMBEDDED_TEST_BINARY=%q not found: %v", testBin, err)
+		}
+		t.Logf("using pre-built test binary: %s", testBin)
+	} else {
+		testBin = filepath.Join(t.TempDir(), "embeddeddolt.test")
+		t.Logf("building test binary: go test -c -tags gms_pure_go -o %s ./internal/storage/embeddeddolt/", testBin)
+		// -tags gms_pure_go is mandatory project-wide (see CLAUDE.md). Without it
+		// the subprocess build pulls in the cgo-backed ICU regex package, which
+		// requires unicode/uregex.h headers that aren't present on Windows
+		// toolchains and breaks the subprocess compile before any assertions run.
+		build := exec.CommandContext(ctx, "go", "test",
+			"-c",
+			"-tags", "gms_pure_go",
+			"-o", testBin,
+			"./internal/storage/embeddeddolt/",
+		)
+		build.Dir = modRoot
+		build.Env = append(os.Environ(), "CGO_ENABLED=1")
+		if out, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("build test binary: %v\n%s", err, string(out))
+		}
+		t.Log("build complete")
 	}
-	t.Log("build complete")
 
 	t.Logf("launching %d subprocesses (%d iterations each)", procs, iters)
 	eg, egCtx := errgroup.WithContext(ctx)
@@ -201,6 +214,35 @@ func mustQueryRow(t *testing.T, db *sql.DB, ctx context.Context, query string, a
 	t.Helper()
 	row := db.QueryRowContext(ctx, query, args...)
 	return row
+}
+
+// TestConcurrentOpenReturnsCached verifies that opening a second store on
+// the same data directory returns the cached instance immediately rather than
+// creating a redundant engine initialization.
+func TestConcurrentOpenReturnsCached(t *testing.T) {
+	if os.Getenv("BEADS_TEST_EMBEDDED_DOLT") != "1" {
+		t.Skip("set BEADS_TEST_EMBEDDED_DOLT=1 to run embedded dolt concurrency tests")
+	}
+	ctx := t.Context()
+	beadsDir := t.TempDir()
+
+	store1, err := embeddeddolt.Open(ctx, beadsDir, "testdb", "main")
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+
+	// Second Open should return immediately with the same cached store.
+	store2, err := embeddeddolt.Open(ctx, beadsDir, "testdb", "main")
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+
+	if store1 != store2 {
+		t.Fatal("expected second Open to return the cached store")
+	}
+
+	store1.Close()
+	store2.Close()
 }
 
 func envInt(name string, def int) int {

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/timeparsing"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -57,13 +57,12 @@ func formatPrettyIssue(issue *types.Issue) string {
 	}
 
 	// Format: STATUS_ICON ID PRIORITY [Type] Title
-	// Priority uses ● icon with color, no brackets needed
 	// Closed issues: entire line is muted
 	if issue.Status == types.StatusClosed {
 		return fmt.Sprintf("%s %s %s %s%s",
 			statusIcon,
 			ui.RenderMuted(issue.ID),
-			ui.RenderMuted(fmt.Sprintf("● P%d", issue.Priority)),
+			ui.RenderMuted(fmt.Sprintf("P%d", issue.Priority)),
 			ui.RenderMuted(string(issue.IssueType)),
 			ui.RenderMuted(" "+issue.Title))
 	}
@@ -80,8 +79,10 @@ func formatPrettyIssueWithContext(issue *types.Issue, parentEpic string) string 
 	return base + " " + ui.RenderMuted("← "+parentEpic)
 }
 
-// formatIssueLong formats a single issue in long format to a buffer
-func formatIssueLong(buf *strings.Builder, issue *types.Issue, labels []string) {
+// formatIssueLong formats a single issue in long format to a buffer.
+// When labelsSkipped is true (AD-02 --skip-labels), the Labels: line shows
+// "(suppressed by --skip-labels)" instead of the (empty) hydration result.
+func formatIssueLong(buf *strings.Builder, issue *types.Issue, labels []string, labelsSkipped bool) {
 	status := string(issue.Status)
 	if status == "closed" {
 		line := fmt.Sprintf("%s%s [P%d] [%s] %s\n  %s",
@@ -101,7 +102,23 @@ func formatIssueLong(buf *strings.Builder, issue *types.Issue, labels []string) 
 	if issue.Assignee != "" {
 		buf.WriteString(fmt.Sprintf("  Assignee: %s\n", issue.Assignee))
 	}
-	if len(labels) > 0 {
+	// This is the one text rendering in the tree that prints a field --brief
+	// drops, so it is the one that has to say so. Keyed off the ROW, not off
+	// the flag: IsLitePartial travels with the issue, so a row that arrived
+	// projected reads the same here whichever door set it. Without this the
+	// listing is indistinguishable from one whose issues have no description,
+	// which is the ambiguity the flag is otherwise careful to avoid.
+	if issue.IsLitePartial {
+		buf.WriteString("  Description: (omitted by --brief)\n")
+	} else if desc := strings.TrimSpace(issue.Description); desc != "" {
+		buf.WriteString("  Description:\n")
+		for _, line := range strings.Split(desc, "\n") {
+			buf.WriteString(fmt.Sprintf("    %s\n", line))
+		}
+	}
+	if labelsSkipped {
+		buf.WriteString("  Labels: (suppressed by --skip-labels)\n")
+	} else if len(labels) > 0 {
 		buf.WriteString(fmt.Sprintf("  Labels: %v\n", labels))
 	}
 	if hasCustomMetadata(issue) {
@@ -187,7 +204,7 @@ func buildBlockingMaps(allDeps map[string][]*types.Dependency, closedIDs map[str
 // getClosedBlockerIDs collects all unique blocker IDs from dependency records
 // and returns the subset that are closed or unreachable. This is used to filter
 // stale "blocked by" annotations in bd list output.
-func getClosedBlockerIDs(ctx context.Context, s *dolt.DoltStore, allDeps map[string][]*types.Dependency) map[string]bool {
+func getClosedBlockerIDs(ctx context.Context, s storage.DoltStorage, allDeps map[string][]*types.Dependency) map[string]bool {
 	// Collect unique blocker IDs
 	blockerIDs := make(map[string]bool)
 	for _, deps := range allDeps {
@@ -234,8 +251,11 @@ func formatIssueCompact(buf *strings.Builder, issue *types.Issue, labels []strin
 		depInfo = " " + depInfo
 	}
 
-	// Get styled status icon
+	// Get styled status icon — override to blocked when issue has open blockers (GH#2858)
 	statusIcon := renderStatusIcon(issue.Status)
+	if len(blockedBy) > 0 && issue.Status == types.StatusOpen {
+		statusIcon = renderStatusIcon(types.StatusBlocked)
+	}
 
 	if issue.Status == types.StatusClosed {
 		// Closed issues: entire line muted (fades visually)
